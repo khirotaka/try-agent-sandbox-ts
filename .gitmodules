@@ -1,0 +1,3 @@
+[submodule "agent-sandbox"]
+	path = agent-sandbox
+	url = https://github.com/khirotaka/agent-sandbox
