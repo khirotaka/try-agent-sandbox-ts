@@ -1,0 +1,63 @@
+version: "3"
+
+vars:
+  CLUSTER: try-agent-sandbox-ts
+
+tasks:
+  default:
+    cmd: task --list
+
+  cluster:create:
+    cmds:
+      - kind create cluster --name {{ .CLUSTER }} --config kind-config.yaml
+      - task: cluster:install-agent-sandbox
+      - task: cluster:install-sandbox-router
+      - task: cluster:install-sandbox-template-and-pool
+
+  cluster:delete:
+    cmd: kind delete cluster --name {{ .CLUSTER }}
+
+  cluster:install-agent-sandbox:
+    env:
+      VERSION: v0.3.10
+    cmds:
+      # To install only the core components:
+      - kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml
+      # To install the extensions components:
+      - kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/extensions.yaml
+
+  cluster:install-sandbox-router:
+    deps:
+      - docker:build-sandbox-router
+      - docker:build-python-runtime-sandbox
+    cmds:
+      - kubectl apply -f manifests/sandbox-router.yaml
+
+  cluster:install-sandbox-template-and-pool:
+    cmds:
+      - kubectl apply -f manifests/sandbox-template-and-pool.yaml
+
+  docker:build-sandbox-router:
+    dir: agent-sandbox/clients/python/agentic-sandbox-client/sandbox-router
+    cmds:
+      - docker build -t sandbox-router:latest .
+      - kind load docker-image sandbox-router:latest --name {{ .CLUSTER }}
+
+  docker:build-python-runtime-sandbox:
+    dir: agent-sandbox/examples/python-runtime-sandbox
+    cmds:
+      - docker build -t kind.local/python-runtime-sandbox:latest .
+      - kind load docker-image kind.local/python-runtime-sandbox:latest --name {{ .CLUSTER }}
+
+  build:sandbox-client:
+    dir: agent-sandbox/clients/typescript/agentic-sandbox-client
+    cmds:
+      - npm install
+
+  run:
+    deps:
+      - build:sandbox-client
+    dir: playground
+    cmds:
+      - npm install
+      - npm run dev
