@@ -19,7 +19,7 @@ tasks:
 
   cluster:install-agent-sandbox:
     env:
-      VERSION: v0.3.10
+      VERSION: v0.4.6
     cmds:
       # To install only the core components:
       - kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml

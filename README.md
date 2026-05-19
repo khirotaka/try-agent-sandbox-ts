@@ -45,7 +45,7 @@ task cluster:create
 This single command:
 
 1. Creates a [kind](https://kind.sigs.k8s.io/) cluster named `try-agent-sandbox-ts`
-2. Installs the agent-sandbox controller (v0.3.10)
+2. Installs the agent-sandbox controller (v0.4.6)
 3. Builds and loads the `sandbox-router` and `python-runtime-sandbox` Docker images
 4. Applies the sandbox template and pool manifests
 
