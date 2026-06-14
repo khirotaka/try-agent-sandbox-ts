@@ -17,5 +17,8 @@
   },
   "dependencies": {
     "agentic-sandbox-client": "file:../agent-sandbox/clients/typescript/agentic-sandbox-client"
+  },
+  "allowScripts": {
+    "file:../../agent-sandbox/clients/typescript/agentic-sandbox-client": true
   }
 }
