@@ -1,12 +1,12 @@
 import { type Sandbox, SandboxClient } from "agentic-sandbox-client";
 
 async function main() {
-	const client = new SandboxClient({});
+	const client = new SandboxClient({ routerNamespace: "default" });
 	const stopAutoCleanup = client.enableAutoCleanup();
 	let sandbox: Sandbox | undefined;
 
 	try {
-		sandbox = await client.createSandbox("python-runtime-template", "default");
+		sandbox = await client.createSandbox("python-sandbox-warmpool", "default");
 		console.log(
 			"Sandbox created:",
 			sandbox.sandboxName,
