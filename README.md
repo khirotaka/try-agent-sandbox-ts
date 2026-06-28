@@ -6,6 +6,8 @@ The goal is to provide a minimal, runnable setup so you can quickly verify that 
 
 `khirotaka/agent-sandbox` is managed as a Git submodule under `agent-sandbox/`.
 
+https://github.com/user-attachments/assets/8ad9504f-95ce-4b15-a15b-e55f1c9ab5b9
+
 ## Prerequisites
 
 | Tool | Version |
