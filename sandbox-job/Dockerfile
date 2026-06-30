@@ -11,7 +11,7 @@ RUN npm install
 
 # Install job dependencies (resolves file: reference to the SDK above)
 WORKDIR /workspace/sandbox-job
-COPY sandbox-job/package.json ./
+COPY sandbox-job/package.json sandbox-job/package-lock.json ./
 RUN npm install
 
 # Copy source
