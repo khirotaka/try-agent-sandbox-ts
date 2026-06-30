@@ -61,3 +61,17 @@ tasks:
     cmds:
       - npm install
       - npm run dev
+
+  docker:build-sandbox-job:
+    cmds:
+      - docker build -t sandbox-job:latest -f sandbox-job/Dockerfile .
+      - kind load docker-image sandbox-job:latest --name {{ .CLUSTER }}
+
+  job:run:
+    deps:
+      - docker:build-sandbox-job
+    cmds:
+      - kubectl delete job sandbox-job --ignore-not-found
+      - kubectl apply -f sandbox-job/k8s/job.yaml
+      - kubectl wait --for=condition=complete job/sandbox-job --timeout=120s
+      - kubectl logs job/sandbox-job

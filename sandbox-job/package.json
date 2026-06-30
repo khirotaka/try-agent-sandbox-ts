@@ -1,0 +1,21 @@
+{
+  "name": "sandbox-job",
+  "version": "1.0.0",
+  "description": "k8s Job that runs simple commands inside an Agent Sandbox",
+  "license": "ISC",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "agentic-sandbox-client": "file:../agent-sandbox/clients/typescript/agentic-sandbox-client"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "allowScripts": {
+    "file:../agent-sandbox/clients/typescript/agentic-sandbox-client": true
+  }
+}

@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-job-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-job-role
+rules:
+  # SandboxClaim CRUD (CLAIM_API_GROUP = "extensions.agents.x-k8s.io")
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # SandboxWarmPool lookup
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]
+    verbs: ["get", "list"]
+  # Sandbox watch (SANDBOX_API_GROUP = "agents.x-k8s.io") — used to wait for Ready
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-job-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbox-job-role
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-job-sa
+    namespace: default
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sandbox-job
+  namespace: default
+spec:
+  template:
+    spec:
+      serviceAccountName: sandbox-job-sa
+      restartPolicy: Never
+      containers:
+        - name: sandbox-job
+          image: sandbox-job:latest
+          imagePullPolicy: Never
+          env:
+            - name: SANDBOX_ROUTER_URL
+              value: "http://sandbox-router-svc.default.svc.cluster.local:8080"
+            - name: WARMPOOL
+              value: "python-sandbox-warmpool"
+            - name: NAMESPACE
+              value: "default"
+  backoffLimit: 0

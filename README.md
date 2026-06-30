@@ -47,17 +47,42 @@ task cluster:create
 This single command:
 
 1. Creates a [kind](https://kind.sigs.k8s.io/) cluster named `try-agent-sandbox-ts`
-2. Installs the agent-sandbox controller (v0.4.6)
+2. Installs the agent-sandbox controller (v0.5.0)
 3. Builds and loads the `sandbox-router` and `python-runtime-sandbox` Docker images
 4. Applies the sandbox template and pool manifests
 
-### 4. Run the demo
+### 4a. Run the playground demo
 
 ```bash
 task run
 ```
 
 The playground ([playground/index.ts](playground/index.ts)) creates a sandbox, runs a command, reads/writes a file, and lists active sandboxes — exercising the core TypeScript client API.
+
+### 4b. Run the k8s Job demo
+
+```bash
+task job:run
+```
+
+This builds a Docker image from [sandbox-job/](sandbox-job/), loads it into kind, and deploys a Kubernetes Job that:
+
+1. Connects to the sandbox router via cluster-internal DNS (**Advanced Mode**)
+2. Creates a sandbox from `python-sandbox-warmpool`
+3. Runs three simple commands inside the sandbox (`echo`, `uname -a`, `python3`)
+4. Deletes the sandbox and exits
+
+Expected output from `kubectl logs job/sandbox-job`:
+
+```
+Connecting to router: http://sandbox-router-svc.default.svc.cluster.local:8080
+Creating sandbox from warmpool: python-sandbox-warmpool
+Sandbox created: <claim-name>
+echo: Hello from Sandbox!
+uname: Linux ...
+python: 42
+Sandbox deleted.
+```
 
 ## Teardown
 
@@ -72,7 +97,11 @@ task cluster:delete
 ├── agent-sandbox/      # Submodule — khirotaka/agent-sandbox (fork of kubernetes-sigs/agent-sandbox)
 │   └── clients/typescript/agentic-sandbox-client/   # TypeScript client source
 ├── manifests/          # Kubernetes manifests for sandbox-router and sandbox pool
-├── playground/         # Demo TypeScript code using agentic-sandbox-client
+├── playground/         # Interactive demo — runs locally via tsx (Dev Mode / port-forward)
+├── sandbox-job/        # Kubernetes Job demo — runs inside the cluster (Advanced Mode)
+│   ├── src/main.ts     # Job entrypoint: creates sandbox, runs commands, cleans up
+│   ├── Dockerfile      # Build context: project root
+│   └── k8s/job.yaml    # ServiceAccount + RBAC + Job manifest
 ├── kind-config.yaml    # kind cluster configuration
 ├── Taskfile.yaml       # Task runner definitions
 └── mise.toml           # Tool version pins
