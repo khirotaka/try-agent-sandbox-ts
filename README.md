@@ -54,7 +54,7 @@ This single command:
 ### 4a. Run the playground demo
 
 ```bash
-task run
+task playground:run
 ```
 
 The playground ([playground/index.ts](playground/index.ts)) creates a sandbox, runs a command, reads/writes a file, and lists active sandboxes — exercising the core TypeScript client API.

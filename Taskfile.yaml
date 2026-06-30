@@ -54,7 +54,7 @@ tasks:
     cmds:
       - npm install
 
-  run:
+  playground:run:
     deps:
       - build:sandbox-client
     dir: playground
