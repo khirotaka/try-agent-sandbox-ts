@@ -3,6 +3,7 @@ kind: SandboxTemplate
 metadata:
   name: python-runtime-template
 spec:
+  service: true
   podTemplate:
     metadata:
       labels:
