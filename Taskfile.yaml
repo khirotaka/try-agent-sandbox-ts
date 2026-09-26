@@ -11,7 +11,6 @@ tasks:
     cmds:
       - kind create cluster --name {{ .CLUSTER }} --config kind-config.yaml
       - task: cluster:install-agent-sandbox
-      - task: cluster:install-sandbox-router
       - task: cluster:install-sandbox-template-and-pool
 
   cluster:delete:
@@ -19,35 +18,26 @@ tasks:
 
   cluster:install-agent-sandbox:
     env:
-      VERSION: v0.5.0
+      VERSION: v1.0.4
     cmds:
-      # To install only the core components:
-      - kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml
-      # To install the extensions components:
-      - kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/extensions.yaml
-
-  cluster:install-sandbox-router:
-    deps:
-      - docker:build-sandbox-router
-      - docker:build-python-runtime-sandbox
-    cmds:
-      - kubectl apply -f manifests/sandbox-router.yaml
+      - kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/sandbox-with-extensions.yaml
+      # The template/pool can only be applied once their CRDs are served.
+      - kubectl wait --for=condition=established --timeout=60s crd/sandboxtemplates.extensions.agents.x-k8s.io crd/sandboxwarmpools.extensions.agents.x-k8s.io crd/sandboxclaims.extensions.agents.x-k8s.io
+      - kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=120s
 
   cluster:install-sandbox-template-and-pool:
+    deps:
+      - docker:build-sandboxd
     cmds:
       - kubectl apply -f manifests/sandbox-template-and-pool.yaml
 
-  docker:build-sandbox-router:
-    dir: agent-sandbox/clients/python/agentic-sandbox-client/sandbox-router
+  # Built from the submodule (not the staging registry) so the daemon always
+  # matches the TypeScript SDK. The build context must be the repo root.
+  docker:build-sandboxd:
+    dir: agent-sandbox
     cmds:
-      - docker build -t sandbox-router:latest .
-      - kind load docker-image sandbox-router:latest --name {{ .CLUSTER }}
-
-  docker:build-python-runtime-sandbox:
-    dir: agent-sandbox/examples/python-runtime-sandbox
-    cmds:
-      - docker build -t kind.local/python-runtime-sandbox:latest .
-      - kind load docker-image kind.local/python-runtime-sandbox:latest --name {{ .CLUSTER }}
+      - docker build -t kind.local/sandboxd:latest -f packages/sandboxd/Dockerfile .
+      - kind load docker-image kind.local/sandboxd:latest --name {{ .CLUSTER }}
 
   build:sandbox-client:
     dir: agent-sandbox/clients/typescript/agentic-sandbox-client

@@ -8,6 +8,9 @@
     "dev": "tsx src/main.ts"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "^2.14.1",
+    "@connectrpc/connect": "^2.1.2",
+    "@connectrpc/connect-node": "^2.1.2",
     "agentic-sandbox-client": "file:../agent-sandbox/clients/typescript/agentic-sandbox-client"
   },
   "devDependencies": {

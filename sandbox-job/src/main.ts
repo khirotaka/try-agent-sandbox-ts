@@ -1,7 +1,6 @@
 import {type ExecutionResult, type Sandbox, SandboxClient} from "agentic-sandbox-client";
 
-const SANDBOX_ROUTER_URL = process.env.SANDBOX_ROUTER_URL ?? "http://sandbox-router-svc.default.svc.cluster.local:8080";
-const WARMPOOL = process.env.WARMPOOL ?? "python-sandbox-warmpool";
+const WARMPOOL = process.env.WARMPOOL ?? "sandboxd-warmpool";
 const NAMESPACE = process.env.NAMESPACE ?? "default";
 
 function assertCommandSucceeded(label: string, result: ExecutionResult): void {
@@ -19,8 +18,14 @@ function assertCommandSucceeded(label: string, result: ExecutionResult): void {
 }
 
 async function main() {
-  console.log(`Connecting to router: ${SANDBOX_ROUTER_URL}`);
-  const client = new SandboxClient({ apiUrl: SANDBOX_ROUTER_URL });
+  // Inside the cluster, dial the Sandbox's headless Service directly instead
+  // of port-forwarding through the apiserver. This requires `service: true`
+  // on the SandboxTemplate and a NetworkPolicy ingress rule admitting this
+  // Pod (see manifests/sandbox-template-and-pool.yaml).
+  const client = new SandboxClient({
+    namespace: NAMESPACE,
+    sandboxd: { connectivity: "in-cluster-service" },
+  });
   const stopAutoCleanup = client.enableAutoCleanup();
   let sandbox: Sandbox | undefined;
   let primaryError: unknown;
@@ -29,15 +34,17 @@ async function main() {
     console.log(`Creating sandbox from warmpool: ${WARMPOOL}`);
     sandbox = await client.createSandbox(WARMPOOL, NAMESPACE);
     console.log(`Sandbox created: ${sandbox.claimName}`);
+    console.log(`Connecting to sandboxd: ${sandbox.serviceFQDN}`);
 
-    const r1 = await sandbox.commands.run('echo "Hello from Sandbox!"');
+    // commands.run() takes an argv; no shell is involved unless you invoke one.
+    const r1 = await sandbox.commands.run("echo", ["Hello from Sandbox!"]);
     assertCommandSucceeded("echo", r1);
 
-    const r2 = await sandbox.commands.run("uname -a");
+    const r2 = await sandbox.commands.run("uname", ["-a"]);
     assertCommandSucceeded("uname", r2);
 
-    const r3 = await sandbox.commands.run('python3 -c "print(6 * 7)"');
-    assertCommandSucceeded("python", r3);
+    const r3 = await sandbox.commands.run("sh", ["-c", "echo $((6 * 7))"]);
+    assertCommandSucceeded("sh", r3);
 
     await client.deleteSandbox(sandbox.claimName, sandbox.namespace);
     console.log("Sandbox deleted.");

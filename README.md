@@ -4,6 +4,8 @@ A demonstration repository for the TypeScript client in [khirotaka/agent-sandbox
 
 The goal is to provide a minimal, runnable setup so you can quickly verify that the TypeScript client works end-to-end.
 
+The client talks to [sandboxd](https://github.com/kubernetes-sigs/agent-sandbox/blob/main/packages/sandboxd/USER_GUIDE.md), the in-sandbox runtime daemon: files over REST (`:8080`) and commands over gRPC (`:9090`).
+
 `khirotaka/agent-sandbox` is managed as a Git submodule under `agent-sandbox/`.
 
 https://github.com/user-attachments/assets/8ad9504f-95ce-4b15-a15b-e55f1c9ab5b9
@@ -47,9 +49,11 @@ task cluster:create
 This single command:
 
 1. Creates a [kind](https://kind.sigs.k8s.io/) cluster named `try-agent-sandbox-ts`
-2. Installs the agent-sandbox controller (v0.5.0)
-3. Builds and loads the `sandbox-router` and `python-runtime-sandbox` Docker images
-4. Applies the sandbox template and pool manifests
+2. Installs the agent-sandbox controller with extensions (v1.0.4)
+3. Builds the `sandboxd` image from the submodule (so the daemon always matches the TypeScript client) and loads it into kind
+4. Applies the `sandboxd-template` SandboxTemplate and `sandboxd-warmpool` SandboxWarmPool ([manifests/sandbox-template-and-pool.yaml](manifests/sandbox-template-and-pool.yaml))
+
+The sandbox runs sandboxd as its only container, so commands execute inside the sandboxd image (`debian:bookworm-slim` with a shell and coreutils — no language runtimes).
 
 ### 4a. Run the playground demo
 
@@ -57,7 +61,12 @@ This single command:
 task playground:run
 ```
 
-The playground ([playground/index.ts](playground/index.ts)) creates a sandbox, runs a command, reads/writes a file, and lists active sandboxes — exercising the core TypeScript client API.
+The playground ([playground/index.ts](playground/index.ts)) runs locally and reaches sandboxd through a pod **port-forward** (the client's default connectivity), so it only needs your kubeconfig. It creates a sandbox and exercises the core TypeScript client API:
+
+- `sandbox.health()` / `sandbox.metadata()`
+- `sandbox.commands.run()` — argv-style execution, `env` / `cwd`, non-zero exit codes, and a missing executable
+- `sandbox.files.*` — write / read / exists / list / delete, binary content, file modes, streaming, and client-side path confinement
+- `SandboxClient` — `listActiveSandboxes`, `listAllSandboxes` (label selector), `getSandboxClaimWarmpoolName`, `getSandbox`, `deleteSandbox`
 
 ### 4b. Run the k8s Job demo
 
@@ -67,22 +76,26 @@ task job:run
 
 This builds a Docker image from [sandbox-job/](sandbox-job/), loads it into kind, and deploys a Kubernetes Job that:
 
-1. Connects to the sandbox router via cluster-internal DNS (**Advanced Mode**)
-2. Creates a sandbox from `python-sandbox-warmpool`
-3. Runs three simple commands inside the sandbox (`echo`, `uname -a`, `python3`)
+1. Creates a sandbox from `sandboxd-warmpool`
+2. Connects to sandboxd directly over the pod network via the Sandbox's headless Service (`connectivity: "in-cluster-service"`)
+3. Runs three simple commands inside the sandbox (`echo`, `uname -a`, `sh -c 'echo $((6 * 7))'`)
 4. Deletes the sandbox and exits
+
+In-cluster access requires `service: true` on the SandboxTemplate and a NetworkPolicy ingress rule that admits the caller. The template's `networkPolicy` allows TCP 8080/9090 only from pods labeled `app: sandbox-job`, which the Job's pod template sets.
 
 Expected output from `kubectl logs job/sandbox-job`:
 
 ```
-Connecting to router: http://sandbox-router-svc.default.svc.cluster.local:8080
-Creating sandbox from warmpool: python-sandbox-warmpool
+Creating sandbox from warmpool: sandboxd-warmpool
 Sandbox created: <claim-name>
-echo: Hello from Sandbox!
-uname: Linux ...
-python: 42
+Connecting to sandboxd: <sandbox-name>.default.svc.cluster.local
+echo stdout: Hello from Sandbox!
+uname stdout: Linux ...
+sh stdout: 42
 Sandbox deleted.
 ```
+
+(stderr/exitCode lines and the client's `[agentic-sandbox-client]` log lines are omitted above.)
 
 ## Teardown
 
@@ -95,10 +108,11 @@ task cluster:delete
 ```
 .
 ├── agent-sandbox/      # Submodule — khirotaka/agent-sandbox (fork of kubernetes-sigs/agent-sandbox)
-│   └── clients/typescript/agentic-sandbox-client/   # TypeScript client source
-├── manifests/          # Kubernetes manifests for sandbox-router and sandbox pool
-├── playground/         # Interactive demo — runs locally via tsx (Dev Mode / port-forward)
-├── sandbox-job/        # Kubernetes Job demo — runs inside the cluster (Advanced Mode)
+│   ├── clients/typescript/agentic-sandbox-client/   # TypeScript client source
+│   └── packages/sandboxd/                           # sandboxd runtime daemon (image built from here)
+├── manifests/          # SandboxTemplate (sandboxd + NetworkPolicy) and SandboxWarmPool
+├── playground/         # Interactive demo — runs locally via tsx (port-forward connectivity)
+├── sandbox-job/        # Kubernetes Job demo — runs inside the cluster (in-cluster-service connectivity)
 │   ├── src/main.ts     # Job entrypoint: creates sandbox, runs commands, cleans up
 │   ├── Dockerfile      # Build context: project root
 │   └── k8s/job.yaml    # ServiceAccount + RBAC + Job manifest

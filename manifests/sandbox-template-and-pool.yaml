@@ -1,39 +1,108 @@
+# SandboxTemplate + SandboxWarmPool backed by the sandboxd runtime daemon
+# (topology A: sandboxd is the pod's only container and IS the execution
+# environment, so commands run inside the sandboxd image — a shell and
+# coreutils, no language runtimes).
+#
+# The image is built from the agent-sandbox submodule by
+# `task docker:build-sandboxd`, so the daemon always matches the TypeScript SDK.
+#
+# Two clients reach sandboxd:
+#   - playground/  (outside the cluster): pod port-forward via the apiserver.
+#     Port-forward traffic enters the pod's network namespace directly and is
+#     not subject to NetworkPolicy.
+#   - sandbox-job/ (inside the cluster):  the Sandbox's headless Service
+#     ("in-cluster-service" connectivity). This needs `service: true` and an
+#     ingress rule admitting the Job's pods, because the controller's default
+#     NetworkPolicy only admits the sandbox-router (which cannot proxy
+#     sandboxd's gRPC ProcessService).
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
-  name: python-runtime-template
+  name: sandboxd-template
+  namespace: default
 spec:
   service: true
+  # Supplying networkPolicy replaces the controller's secure defaults entirely,
+  # so the default egress rule (public internet only) is restated below.
+  networkPolicy:
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                app: sandbox-job
+        ports:
+          - protocol: TCP
+            port: 8080 # REST filesystem + health/metadata
+          - protocol: TCP
+            port: 9090 # gRPC ProcessService
+    egress:
+      - to:
+          - ipBlock:
+              cidr: 0.0.0.0/0
+              except:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 169.254.0.0/16
+          - ipBlock:
+              cidr: ::/0
+              except:
+                - fc00::/7
+                - fe80::/10
   podTemplate:
-    metadata:
-      labels:
-        sandbox: python-sandbox-example
     spec:
+      # The sandbox runs untrusted agent code; it needs no API access.
+      automountServiceAccountToken: false
+      restartPolicy: "OnFailure"
+      securityContext:
+        runAsNonRoot: true
+        # Ensure the workspace emptyDir is writable by the non-root runtime user.
+        fsGroup: 1000
       containers:
-        - name: python-runtime
-          image: kind.local/python-runtime-sandbox:latest
+        - name: sandboxd
+          image: kind.local/sandboxd:latest
           imagePullPolicy: IfNotPresent
+          env:
+            # Exposed through sandbox.metadata() (sandboxd serves only the
+            # SANDBOX_ prefix and withholds credential-looking names).
+            - name: SANDBOX_EXAMPLE
+              value: try-agent-sandbox-ts
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
-            - containerPort: 8888
+            - containerPort: 8080 # REST filesystem + probes
+            - containerPort: 9090 # gRPC ProcessService
           readinessProbe:
             httpGet:
-              path: "/"
-              port: 8888
-            initialDelaySeconds: 0
+              path: /v1/health
+              port: 8080
             periodSeconds: 1
           resources:
             requests:
-              cpu: "250m"
-              memory: "512Mi"
-              ephemeral-storage: "512Mi"
-      restartPolicy: "OnFailure"
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          emptyDir: {}
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool
 metadata:
-  name: python-sandbox-warmpool
+  name: sandboxd-warmpool
+  namespace: default
 spec:
   replicas: 1
   sandboxTemplateRef:
-    name: python-runtime-template
-
+    name: sandboxd-template

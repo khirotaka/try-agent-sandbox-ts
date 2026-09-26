@@ -13,14 +13,13 @@ rules:
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxclaims"]
     verbs: ["create", "get", "list", "watch", "delete"]
-  # SandboxWarmPool lookup
-  - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxwarmpools"]
-    verbs: ["get", "list"]
-  # Sandbox watch (SANDBOX_API_GROUP = "agents.x-k8s.io") — used to wait for Ready
+  # Sandbox watch (SANDBOX_API_GROUP = "agents.x-k8s.io") — used to wait for
+  # Ready and to read status.serviceFQDN.
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "list", "watch"]
+  # No pods/portforward: with "in-cluster-service" connectivity the SDK dials
+  # sandboxd over the pod network, keeping the apiserver off the data path.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -42,6 +41,10 @@ metadata:
   namespace: default
 spec:
   template:
+    metadata:
+      labels:
+        # Admitted to sandboxd's ports by the SandboxTemplate's networkPolicy.
+        app: sandbox-job
     spec:
       serviceAccountName: sandbox-job-sa
       restartPolicy: Never
@@ -50,10 +53,8 @@ spec:
           image: sandbox-job:latest
           imagePullPolicy: Never
           env:
-            - name: SANDBOX_ROUTER_URL
-              value: "http://sandbox-router-svc.default.svc.cluster.local:8080"
             - name: WARMPOOL
-              value: "python-sandbox-warmpool"
+              value: "sandboxd-warmpool"
             - name: NAMESPACE
               value: "default"
   backoffLimit: 0
