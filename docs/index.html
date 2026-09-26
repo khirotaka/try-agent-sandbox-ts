@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Sandbox 解説</title>
+<meta name="description" content="Agent Sandbox の 4 つの CRD、in-sandbox ランタイム sandboxd、TypeScript SDK（Kubernetes リソース管理層と sandboxd 通信層）の仕組みを図で解説する非公式ドキュメント。">
+<link rel="alternate" hreflang="ja" href="./">
+<link rel="alternate" hreflang="en" href="./en/">
+<link rel="stylesheet" href="assets/style.css">
+<script>
+  try {
+    var t = localStorage.getItem("as-doc-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<script type="module" src="assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <button class="toc-toggle" type="button" aria-label="目次">☰</button>
+  <a class="site-title" href="./">Agent Sandbox 解説（非公式）</a>
+  <span class="header-spacer"></span>
+  <nav class="lang-tabs" aria-label="言語">
+    <a href="./" data-lang="ja" aria-current="page">日本語</a>
+    <a href="./en/" data-lang="en">English</a>
+  </nav>
+  <button class="theme-toggle" type="button" aria-label="テーマ切替">☾</button>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="目次">
+  <p class="toc-title">目次</p>
+  <ol>
+    <li><a href="#overview">0. はじめに</a></li>
+    <li><a href="#big-picture">1. 全体像</a></li>
+    <li><a href="#crds">2. 4 つの CRD</a>
+      <ol>
+        <li><a href="#crd-sandbox">Sandbox</a></li>
+        <li><a href="#crd-template">SandboxTemplate</a></li>
+        <li><a href="#crd-warmpool">SandboxWarmPool</a></li>
+        <li><a href="#crd-claim">SandboxClaim</a></li>
+        <li><a href="#crd-flow">Claim が Sandbox になるまで</a></li>
+      </ol>
+    </li>
+    <li><a href="#sandboxd">3. sandboxd</a>
+      <ol>
+        <li><a href="#sandboxd-api">API（gRPC + REST）</a></li>
+        <li><a href="#sandboxd-internals">内部の仕組み</a></li>
+        <li><a href="#sandboxd-topology">デプロイ構成</a></li>
+        <li><a href="#sandboxd-security">セキュリティモデル</a></li>
+      </ol>
+    </li>
+    <li><a href="#sdk">4. TypeScript SDK</a>
+      <ol>
+        <li><a href="#sdk-layers">2 層アーキテクチャ</a></li>
+        <li><a href="#sdk-k8s">K8s リソース管理層</a></li>
+        <li><a href="#sdk-conn">sandboxd 通信層</a></li>
+        <li><a href="#sdk-connectivity">接続方式</a></li>
+        <li><a href="#sdk-ops">操作の実行とエラー</a></li>
+      </ol>
+    </li>
+    <li><a href="#e2e">5. エンドツーエンド</a></li>
+    <li><a href="#demos">6. このリポジトリのデモ</a></li>
+    <li><a href="#references">7. 参考リンク</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section class="hero" id="overview">
+  <h1>Agent Sandbox と TypeScript SDK のしくみ</h1>
+  <p class="lede">Kubernetes 上で AI エージェント用の隔離実行環境を提供する <a href="https://github.com/kubernetes-sigs/agent-sandbox">kubernetes-sigs/agent-sandbox</a>。その 4 つの CRD、Pod 内ランタイム <code>sandboxd</code>、そして TypeScript SDK の内部構造を、図を中心に解説します。</p>
+  <div class="badges">
+    <span class="badge">controller v1.0.4</span>
+    <span class="badge">API v1beta1</span>
+    <span class="badge">fork: khirotaka/agent-sandbox @ 7d97d6e</span>
+  </div>
+</section>
+
+<div class="callout warn">
+  <p><strong>非公式ドキュメントです。</strong>TypeScript SDK（<code>agentic-sandbox-client</code>）は <a href="https://github.com/khirotaka/agent-sandbox">khirotaka/agent-sandbox</a>（fork）にのみ存在し、執筆時点で upstream の kubernetes-sigs/agent-sandbox にはマージされていません。API や挙動は予告なく変わる可能性があります。本文はこのリポジトリの submodule が指すコミットのソースコードに基づいています。</p>
+</div>
+
+<p>この記事は次の 3 つの問いに答えます。</p>
+<ol>
+  <li><strong>4 つの CRD</strong>（Sandbox / SandboxTemplate / SandboxWarmPool / SandboxClaim）はそれぞれ何を表し、どう連携するのか</li>
+  <li><strong>sandboxd</strong> は Pod の中で何をしているのか</li>
+  <li><strong>TypeScript SDK</strong> は「K8s リソースの管理」と「sandboxd との通信」をどう実装しているのか</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="big-picture"><span class="num">1.</span>全体像</h2>
+
+<p>Agent Sandbox は、<strong>コントロールプレーン</strong>（どの Pod をいつ用意するか）と<strong>データプレーン</strong>（用意した Pod の中でファイル操作・コマンド実行をする）の 2 つにはっきり分かれています。SDK もこの境界に沿って 2 層に分かれています。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph APP["アプリ / エージェント（Node.js）"]
+    direction LR
+    SC["SandboxClient"] ~~~ SB["Sandbox ハンドル&lt;br/&gt;.files / .commands"]
+  end
+
+  subgraph CP["コントロールプレーン"]
+    direction LR
+    API[("kube-apiserver")] &lt;--> CTRL["agent-sandbox-controller&lt;br/&gt;（4 つの Reconciler）"]
+  end
+
+  subgraph POD["Sandbox Pod"]
+    direction LR
+    D["sandboxd&lt;br/&gt;REST :8080 / gRPC :9090"] --- WS[("/workspace")]
+  end
+
+  SC -- "① SandboxClaim を作成・Watch" --> API
+  CTRL -- "② Pod / Service / NetworkPolicy を用意" --> POD
+  SB -- "③ ファイル (REST) / コマンド (gRPC)" --> D
+</pre>
+<figcaption>図 1: 全体像。①② が Kubernetes リソース管理、③ が sandboxd との通信。</figcaption>
+</figure>
+
+<div class="cards">
+  <div class="card"><div class="card-kicker">control plane</div><div class="card-title">CRD + コントローラ</div><p>「どんな Pod を」「何個温めておき」「誰に割り当てるか」を宣言的に管理する。</p></div>
+  <div class="card"><div class="card-kicker">data plane</div><div class="card-title">sandboxd</div><p>Pod 内で動くデーモン。ファイル API（REST）とプロセス API（gRPC）を提供する。</p></div>
+  <div class="card"><div class="card-kicker">client</div><div class="card-title">TypeScript SDK</div><p>Claim の作成〜Ready 待ち〜削除と、sandboxd への接続・呼び出しを 1 つのハンドルにまとめる。</p></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="crds"><span class="num">2.</span>4 つの CRD</h2>
+
+<p>CRD は 2 つの API グループに分かれています。コアの <code>agents.x-k8s.io</code> には <strong>Sandbox</strong> だけがあり、それ単体で「1 つの隔離環境」を表現できます。残りの 3 つは <code>extensions.agents.x-k8s.io</code> にあり、<strong>テンプレート化・事前ウォームアップ・払い出し</strong>という運用上の仕組みを Sandbox の上に積み上げています。</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Kind</th><th>API グループ</th><th>ひとことで</th><th>主に誰が作るか</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Sandbox</strong></td><td><code>agents.x-k8s.io</code></td><td>隔離環境 1 つ分（Pod + 任意の Service / PVC）</td><td>WarmPool / Claim コントローラ（直接作成も可）</td></tr>
+    <tr><td><strong>SandboxTemplate</strong></td><td><code>extensions.agents.x-k8s.io</code></td><td>Sandbox の設計図 + NetworkPolicy + Claim に許す上書き範囲</td><td>プラットフォーム管理者</td></tr>
+    <tr><td><strong>SandboxWarmPool</strong></td><td><code>extensions.agents.x-k8s.io</code></td><td>テンプレートから Sandbox を N 個事前起動しておくプール</td><td>プラットフォーム管理者</td></tr>
+    <tr><td><strong>SandboxClaim</strong></td><td><code>extensions.agents.x-k8s.io</code></td><td>「プールから 1 つください」という払い出し要求</td><td>アプリ / SDK</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  T["SandboxTemplate&lt;br/&gt;podTemplate / networkPolicy / 上書きポリシー"]
+  WP["SandboxWarmPool&lt;br/&gt;replicas / sandboxTemplateRef"]
+  C["SandboxClaim&lt;br/&gt;warmPoolRef / lifecycle"]
+  NP["NetworkPolicy&lt;br/&gt;（テンプレートごとに 1 つ共有）"]
+
+  subgraph POOL["プール所有（未割り当て）"]
+    S1["Sandbox"]
+    S2["Sandbox"]
+  end
+  S3["Sandbox（Claim 所有）"]
+
+  subgraph RES["Sandbox が所有する下位リソース"]
+    P["Pod"]
+    SVC["headless Service&lt;br/&gt;(service: true の場合)"]
+    PVC["PVC&lt;br/&gt;(volumeClaimTemplates)"]
+  end
+
+  WP -- "参照" --> T
+  C -- "参照" --> WP
+  T -. "生成・管理" .-> NP
+  WP -- "作成・補充" --> S1
+  WP -- "作成・補充" --> S2
+  C -- "採用 (adopt) または新規作成" --> S3
+  S3 --> P
+  S3 --> SVC
+  S3 --> PVC
+</pre>
+<figcaption>図 2: CRD 間の関係。Claim が採用した瞬間に Sandbox の所有者は WarmPool から Claim へ移る。</figcaption>
+</figure>
+
+<div class="callout">
+  <p><strong>たとえるなら:</strong> SandboxTemplate は「クラス定義」、SandboxWarmPool は「事前に温めた ReplicaSet」、SandboxClaim と Sandbox の関係は <em>PersistentVolumeClaim と PersistentVolume</em> の関係に近いものです。利用者は Claim だけを書き、実体（Sandbox）の割り当てはコントローラが行います。</p>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="crd-sandbox">Sandbox（<code>agents.x-k8s.io/v1beta1</code>）</h3>
+
+<p>Agent Sandbox の中核となるリソースで、<strong>「ステートフルな単一 Pod」</strong>を表します。Deployment のように複数レプリカを持つのではなく、1 Sandbox = 1 Pod で、名前・ボリューム・ネットワーク上の識別子が安定していることが特徴です。</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>フィールド</th><th>意味</th></tr></thead>
+  <tbody>
+    <tr><td><code>spec.podTemplate</code></td><td>作成する Pod の spec とラベル・アノテーション</td></tr>
+    <tr><td><code>spec.volumeClaimTemplates</code></td><td>Sandbox 用に作る PVC のテンプレート</td></tr>
+    <tr><td><code>spec.service</code></td><td><code>true</code> で headless Service（<code>ClusterIP: None</code>）を作成。未指定なら新規作成しない</td></tr>
+    <tr><td><code>spec.operatingMode</code></td><td><code>Running</code>（既定）/ <code>Suspended</code>。Suspended では Pod を止めつつ Sandbox とボリュームは残す</td></tr>
+    <tr><td><code>spec.shutdownTime</code> / <code>shutdownPolicy</code></td><td>期限到達で Pod と Service を削除。Sandbox 自体は <code>Retain</code>（既定）で残す / <code>Delete</code> で削除</td></tr>
+    <tr><td><code>status.conditions[Ready]</code></td><td>Pod が実際に Running かつ Ready になって初めて True</td></tr>
+    <tr><td><code>status.podIPs</code> / <code>serviceFQDN</code> / <code>nodeName</code></td><td>接続先の手がかり。SDK の in-cluster 接続はここを読む</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  direction LR
+  [*] --> Pending: Sandbox 作成
+  Pending --> Ready: Pod Running かつ Ready
+  Ready --> Suspended: operatingMode = Suspended
+  Suspended --> Pending: operatingMode = Running
+  Ready --> Expired: shutdownTime 到達
+  Pending --> Expired: shutdownTime 到達
+  Expired --> [*]: shutdownPolicy = Delete
+  Expired --> Expired: Retain（Ready=False / SandboxExpired）
+  note right of Suspended
+    Pod は削除されるが
+    Sandbox と PVC は残る
+  end note
+</pre>
+<figcaption>図 3: Sandbox の状態遷移（概念図）。Ready 条件が「実際に使える」ことの唯一の信頼できるシグナル。</figcaption>
+</figure>
+
+<p><code>operatingMode</code> は「こうあってほしい」という<em>意図</em>で、実際の状態は <code>Ready</code> 条件で判断します。SDK もこの <code>Ready=True</code> を待ってからハンドルを返します。</p>
+
+<!-- ------------------------------ -->
+<h3 id="crd-template">SandboxTemplate（<code>extensions.agents.x-k8s.io/v1beta1</code>）</h3>
+
+<p>Sandbox の「設計図」です。Sandbox と共通の <code>SandboxBlueprint</code>（podTemplate / volumeClaimTemplates / service）を埋め込み、さらに<strong>ネットワーク分離</strong>と<strong>Claim に許す上書きの範囲</strong>を定めます。</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>フィールド</th><th>既定値</th><th>意味</th></tr></thead>
+  <tbody>
+    <tr><td><code>networkPolicyManagement</code></td><td><code>Managed</code></td><td>Managed ならコントローラがテンプレート単位で共有 NetworkPolicy を 1 つ管理。<code>Unmanaged</code> なら一切作らない（Cilium 等に任せる）</td></tr>
+    <tr><td><code>networkPolicy</code></td><td>（安全な既定）</td><td>省略時: Ingress は sandbox-router からのみ、Egress はパブリックインターネットのみ（RFC1918・メタデータサーバ等を遮断）。指定すると<strong>既定を丸ごと置き換える</strong></td></tr>
+    <tr><td><code>envVarsInjectionPolicy</code></td><td><code>Disallowed</code></td><td>Claim の <code>spec.env</code> を許すか（<code>Allowed</code>: 追加のみ / <code>Overrides</code>: 上書きも可）</td></tr>
+    <tr><td><code>volumeClaimTemplatesPolicy</code></td><td><code>Disallowed</code></td><td>Claim による PVC テンプレートの追加・上書きを許すか</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>また、テンプレート経由で作られる Pod は <code>automountServiceAccountToken</code> が未指定なら <code>false</code> に補正されます。信頼できないコードを走らせる前提の「secure by default」設計です。</p>
+
+<!-- ------------------------------ -->
+<h3 id="crd-warmpool">SandboxWarmPool（<code>extensions.agents.x-k8s.io/v1beta1</code>）</h3>
+
+<p>コンテナイメージの pull や起動にかかる時間を利用者に見せないため、テンプレートから Sandbox を <code>replicas</code> 個<strong>先に起動しておく</strong>プールです。プール内の Sandbox は Claim に採用されると所有権が Claim に移り、プールは減った分を自動で補充します。HPA でスケールさせることもできます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph WP["SandboxWarmPool (replicas: 3)"]
+    A["Sandbox A&lt;br/&gt;Ready"]
+    B["Sandbox B&lt;br/&gt;Ready"]
+    Cc["Sandbox C&lt;br/&gt;起動中"]
+  end
+  CL["SandboxClaim"] -- "採用 (ownerRef 付け替え)" --> A
+  A -. "プールから外れる" .-> OUT["Claim 所有の Sandbox A"]
+  WP -- "不足分を補充" --> N["新しい Sandbox D"]
+</pre>
+<figcaption>図 4: 採用と補充。Ready な候補が優先的に採用される。</figcaption>
+</figure>
+
+<p>テンプレートが変わったときの古い Sandbox の扱いは <code>updateStrategy</code> で決まります。</p>
+<ul>
+  <li><strong><code>OnReplenish</code>（既定）</strong>: 古い未割り当て Sandbox はそのまま残し、手動削除か Claim による採用で抜けたときに新しいものへ入れ替わる。</li>
+  <li><strong><code>Recreate</code></strong>: 古い未割り当て Sandbox を即座に削除し、プールを最新テンプレートのものだけにする。</li>
+</ul>
+<p>どちらの戦略でも、<strong>すでに Claim に割り当て済みの Sandbox には触れません</strong>。</p>
+
+<!-- ------------------------------ -->
+<h3 id="crd-claim">SandboxClaim（<code>extensions.agents.x-k8s.io/v1beta1</code>）</h3>
+
+<p>アプリ（や SDK）が実際に作成するのはこのリソースです。「どのプールから」「いつまで」使うかを宣言します。</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>フィールド</th><th>意味</th></tr></thead>
+  <tbody>
+    <tr><td><code>spec.warmPoolRef.name</code></td><td>払い出し元のプール（必須）</td></tr>
+    <tr><td><code>spec.lifecycle.shutdownTime</code></td><td>Claim の期限。到達するとコントローラが下位の Sandbox を削除する</td></tr>
+    <tr><td><code>spec.lifecycle.shutdownPolicy</code></td><td><code>Retain</code>（既定）/ <code>Delete</code> / <code>DeleteForeground</code>（Sandbox と Pod が消えきるまで Claim を残す）</td></tr>
+    <tr><td><code>spec.lifecycle.ttlSecondsAfterFinished</code></td><td>終了後に Claim を保持する秒数</td></tr>
+    <tr><td><code>spec.additionalPodMetadata</code></td><td>Pod に伝播するラベル・アノテーション（許可ドメインのみ）</td></tr>
+    <tr><td><code>spec.env</code> / <code>spec.volumeClaimTemplates</code></td><td>テンプレートのポリシーが許せば指定可。<strong>指定するとウォームプールは使われずコールドスタート</strong>になる</td></tr>
+    <tr><td><code>status.sandbox.name</code></td><td>割り当てられた Sandbox の名前。SDK はまずここを待つ</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <p><strong>なぜ env を指定するとコールドスタートになるのか:</strong> 環境変数は Pod 作成時に焼き込まれるもので、すでに起動しているプールの Pod に後から注入できないためです。</p>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="crd-flow">Claim が Sandbox になるまで</h3>
+
+<p>SandboxClaim コントローラは、まず「既存の Sandbox を見つける／プールから採用する」<strong>ファストパス</strong>を試し、候補がなければテンプレートから新規作成する<strong>コールドパス</strong>に進みます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S(["SandboxClaim を Reconcile"]) --> E{"期限切れ？"}
+  E -- "はい" --> X["Sandbox を削除し&lt;br/&gt;shutdownPolicy を適用"]
+  E -- "いいえ" --> F{"既に割り当て済みの&lt;br/&gt;Sandbox がある？"}
+  F -- "はい" --> M["メタデータを同期"]
+  F -- "いいえ" --> Q{"env / PVC 指定なし かつ&lt;br/&gt;プールに候補がある？"}
+  Q -- "はい" --> R{"Ready な候補？"}
+  R -- "はい" --> AD["即採用（ファストパス）"]
+  R -- "いいえ" --> FB["Ready でない候補を&lt;br/&gt;フォールバックとして採用"]
+  Q -- "いいえ" --> CO["テンプレートを取得し&lt;br/&gt;Sandbox を新規作成（コールドパス）"]
+  AD --> ST["status.sandbox.name 等を更新"]
+  FB --> ST
+  CO --> ST
+  M --> ST
+</pre>
+<figcaption>図 5: SandboxClaim コントローラの判断（簡略化）。Recreate 戦略では古い候補はスキップされる。</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as アプリ / SDK
+  participant API as kube-apiserver
+  participant CC as Claim コントローラ
+  participant WPC as WarmPool コントローラ
+  participant SC as Sandbox コントローラ
+
+  Note over WPC,SC: 事前: プールが Sandbox を replicas 個作成し Pod を起動済み
+  U->>API: SandboxClaim を作成
+  API-->>CC: 変更通知
+  CC->>API: プールの Ready な Sandbox を採用（ownerRef を Claim へ）
+  CC->>API: Claim.status.sandbox.name を設定
+  API-->>WPC: プールの Sandbox が減った
+  WPC->>API: 補充用の Sandbox を作成
+  API-->>SC: 新しい Sandbox
+  SC->>API: Pod（と Service / PVC）を作成
+  U->>API: Sandbox の Ready=True を Watch で確認
+</pre>
+<figcaption>図 6: ウォームパスでの払い出し。利用者が待つのは「採用」だけで、補充は裏で進む。</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="sandboxd"><span class="num">3.</span>sandboxd — Pod 内ランタイムデーモン</h2>
+
+<p><code>sandboxd</code>（<code>packages/sandboxd</code>）は Sandbox Pod の中で動く Go 製のデーモンで、KEP-539.2（runtime standardization）で定義された<strong>ポータブルなランタイム API のリファレンス実装</strong>です。SDK は sandboxd のバイナリではなく、この<strong>ワイヤ契約</strong>（proto と OpenAPI）に依存しています。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  CL["クライアント&lt;br/&gt;(SDK / curl / grpcurl)"]
+  subgraph POD["Sandbox Pod"]
+    subgraph C["sandboxd コンテナ"]
+      G["gRPC :9090&lt;br/&gt;ProcessService"]
+      R["HTTP :8080&lt;br/&gt;Filesystem / health / metadata"]
+      PM["ProcessRegistry"]
+      PU["pathutil.SanitizePath"]
+      CH["子プロセス群&lt;br/&gt;（プロセスグループ単位）"]
+    end
+    W[("/workspace&lt;br/&gt;--root-dir")]
+  end
+  CL -- "HTTP/2 gRPC" --> G
+  CL -- "HTTP/1.1 REST" --> R
+  G --> PM --> CH
+  G -- "cwd を検証" --> PU
+  R -- "パスを検証" --> PU
+  PU --> W
+  CH -- "cwd = /workspace 配下" --> W
+</pre>
+<figcaption>図 7: sandboxd の構成。REST で書いたファイルは gRPC で起動したプロセスから見える（同じルート配下）。</figcaption>
+</figure>
+
+<h3 id="sandboxd-api">API（gRPC + REST のハイブリッド）</h3>
+
+<p>なぜ 2 つのプロトコルを使い分けるのでしょうか。</p>
+<ul>
+  <li><strong>プロセス実行は gRPC</strong> — <code>Start</code> は stdout/stderr をプロセス終了まで流し続けるサーバーストリーミング RPC なので、HTTP/2 ストリームが自然。</li>
+  <li><strong>ファイル転送は REST</strong> — 中身を protobuf で包まず <code>application/octet-stream</code> の生バイトで送れる。生成スタブなしで curl でも扱える。</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th colspan="3">ProcessService（gRPC :9090）</th></tr><tr><th>RPC</th><th>種類</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td><code>Execute</code></td><td>Unary</td><td>同期実行し stdout / stderr / exit_code をまとめて返す（<strong>TS SDK の <code>run()</code> はこれ</strong>）</td></tr>
+    <tr><td><code>Start</code></td><td>Server stream</td><td>InitEvent → 出力チャンク → ExitEvent をストリーム。PTY 対応</td></tr>
+    <tr><td><code>WriteStdin</code></td><td>Unary</td><td>実行中プロセスへ stdin / EOF を送る</td></tr>
+    <tr><td><code>SendSignal</code></td><td>Unary</td><td>プロセスグループへ SIGINT / SIGTERM / SIGKILL</td></tr>
+    <tr><td><code>ResizeTTY</code></td><td>Unary</td><td>PTY のサイズ変更</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th colspan="3">Filesystem &amp; Runtime REST API（HTTP :8080）</th></tr><tr><th>メソッド</th><th>エンドポイント</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET</code></td><td><code>/v1/files/{path}</code></td><td>ファイルなら生バイト、ディレクトリなら JSON の一覧</td></tr>
+    <tr><td><code>HEAD</code></td><td><code>/v1/files/{path}</code></td><td>存在確認（本文なし）</td></tr>
+    <tr><td><code>PUT</code></td><td><code>/v1/files/{path}</code></td><td>アトミック書き込み。親ディレクトリ自動作成、<code>?mode=0644</code></td></tr>
+    <tr><td><code>DELETE</code></td><td><code>/v1/files/{path}</code></td><td>削除。空でないディレクトリは <code>?recursive=true</code> が必要（なければ 409）</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/health</code></td><td>Readiness。<code>200 {"status":"ok"}</code>、シャットダウン中は 503</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/metadata</code></td><td><code>SANDBOX_</code> 接頭辞の環境変数（認証情報っぽい名前は除外）</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 id="sandboxd-internals">内部の仕組み</h3>
+
+<h4>パスの閉じ込め（path confinement）</h4>
+<p>ファイル API のパスも、プロセスの <code>cwd</code> も、同じ <code>SanitizePath</code> を通ります。シンボリックリンクを解決した<em>後の</em>実パスがルート配下にあるかを確認するので、<code>../</code> やシンボリックリンク経由の脱出を防げます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  IN["要求パス&lt;br/&gt;例: src/../../etc/passwd"] --> J["root-dir と結合して Clean"]
+  J --> EV["EvalSymlinks&lt;br/&gt;（存在しなければ祖先で解決）"]
+  EV --> CK{"解決後のパスが&lt;br/&gt;root-dir 配下？"}
+  CK -- "はい" --> OK["処理を続行"]
+  CK -- "いいえ" --> NG["REST: 403 PERMISSION_DENIED&lt;br/&gt;gRPC: PERMISSION_DENIED"]
+</pre>
+<figcaption>図 8: SanitizePath によるシンボリックリンク考慮の閉じ込め。</figcaption>
+</figure>
+
+<h4>アトミック書き込み</h4>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as クライアント
+  participant H as PUT ハンドラ
+  participant FS as /workspace
+  C->>H: PUT /v1/files/src/app.py（本文ストリーム）
+  H->>FS: MkdirAll(src/)
+  H->>FS: CreateTemp(src/.sandboxd-tmp-*)
+  H->>FS: Chmod(mode) → io.Copy → Sync → Close
+  H->>FS: Rename(tmp → src/app.py)
+  H-->>C: 204 No Content
+  Note over H,FS: 途中で失敗・切断したら一時ファイルを削除。&lt;br/&gt;読み手は「前の完全な内容」か「新しい完全な内容」しか見ない
+</pre>
+<figcaption>図 9: 一時ファイル + rename によるアトミック書き込み。</figcaption>
+</figure>
+
+<h4>プロセスの実行と後始末</h4>
+<p><code>Execute</code> はコマンドを <strong>シェルを介さず argv のまま</strong> <code>exec</code> し、<code>Setpgid</code> で独立したプロセスグループに入れます。クライアントのデッドライン切れやキャンセルでコンテキストが終わると、孫プロセスまで含めてプロセスグループごと SIGKILL します（gVisor 向けに <code>/proc</code> を辿るフォールバックもあります）。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as クライアント
+  participant PS as ProcessServer
+  participant P as 子プロセス（新 PGID）
+  C->>PS: Execute(command, env, cwd) + deadline
+  Note over PS: cwd を SanitizePath、env を os.Environ() に後勝ちで追加
+  PS->>P: exec（Setpgid: true）
+  alt 正常終了
+    P-->>PS: exit(code)
+    PS-->>C: stdout / stderr / exit_code（非 0 もエラーではない）
+  else コンテキスト終了（期限・キャンセル）
+    PS->>P: kill(-PGID, SIGKILL)
+    PS-->>C: DEADLINE_EXCEEDED / CANCELLED
+  end
+</pre>
+<figcaption>図 10: Execute の流れ。存在しない実行ファイルは NOT_FOUND になる（シェル経由の 127 ではない）。</figcaption>
+</figure>
+
+<p>デーモン自身が SIGTERM を受けた場合は、管理下のプロセスに SIGTERM → 猶予 → SIGKILL を送ってから HTTP / gRPC サーバーを閉じます。</p>
+
+<h3 id="sandboxd-topology">デプロイ構成（どこでコマンドが走るか）</h3>
+
+<p>もっとも重要な事実は、<strong>コマンドは sandboxd プロセスが動いているコンテナのルートファイルシステムで実行される</strong>ということです。共有ボリュームは<em>ファイル</em>を共有しますが<em>バイナリ</em>は共有しません。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph A["A: 専用ランタイムコンテナ（既定・このリポジトリ）"]
+    direction LR
+    A1["sandboxd イメージ&lt;br/&gt;(debian-slim + sh + coreutils)"] --> A2["コマンドは&lt;br/&gt;このイメージ内で実行"]
+  end
+  subgraph B["B: 既存イメージへ注入"]
+    direction LR
+    B0["initContainer が&lt;br/&gt;静的バイナリを&lt;br/&gt;emptyDir にコピー"] --> B1["ツール入りの既存イメージが&lt;br/&gt;sandboxd を command として起動"] --> B2["コマンドは既存イメージ内で実行&lt;br/&gt;(npm 等がそのまま使える)"]
+  end
+  subgraph X["よくある落とし穴: サイドカー"]
+    direction LR
+    X2["ワークロードコンテナ&lt;br/&gt;(python, npm ...)"] --- X3[("/workspace 共有")] --- X1["sandboxd コンテナ"] --> X4["コマンドは sandboxd 側で実行され&lt;br/&gt;ワークロードのツールは見えない"]
+  end
+  A ~~~ B ~~~ X
+</pre>
+<figcaption>図 11: デプロイ構成。A は隔離が強く、B はイメージの再ビルドが不要。</figcaption>
+</figure>
+
+<h3 id="sandboxd-security">セキュリティモデル</h3>
+<ul>
+  <li><strong>認証・TLS はしない。</strong>port-forward なら apiserver の RBAC（<code>pods/portforward</code>）が認可を担い、Pod ネットワーク経由なら NetworkPolicy やサービスメッシュで保護する。</li>
+  <li><strong>待受は <code>0.0.0.0</code> が既定。</strong>封じ込めは loopback バインドではなく Pod 分離と NetworkPolicy で行う。</li>
+  <li><strong>パスの閉じ込め</strong>は全ファイルパスと <code>cwd</code> に適用。ただしプロセスのネットワークやファイルシステム全体の隔離は RuntimeClass・securityContext・NetworkPolicy の役目。</li>
+  <li><strong>metadata</strong> は接頭辞で許可されたものだけ返し、<code>TOKEN</code> / <code>SECRET</code> / <code>PASSWORD</code> / <code>CREDENTIAL</code> / <code>KEY</code> を含む名前は常に除外。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="sdk"><span class="num">4.</span>TypeScript SDK（agentic-sandbox-client）</h2>
+
+<p><code>clients/typescript/agentic-sandbox-client</code> は Go / Python クライアントと同じ概念を TypeScript で提供する SDK です（Node.js 22 以上、ESM）。依存は <code>@kubernetes/client-node</code> と <code>ws</code> が必須で、gRPC 用の <code>@bufbuild/protobuf</code>・<code>@connectrpc/connect(-node)</code> は <strong><code>run()</code> を初めて呼んだときに遅延 import される optional peer</strong> です。</p>
+
+<pre class="code"><code>import { SandboxClient } from "agentic-sandbox-client";
+
+const client = new SandboxClient({ namespace: "default" });
+const sandbox = await client.createSandbox("sandboxd-warmpool"); <span class="c-cm">// ← K8s リソース管理層</span>
+try {
+  await sandbox.files.write("hello.txt", "hi\n");                  <span class="c-cm">// ← sandboxd 通信層 (REST)</span>
+  const r = await sandbox.commands.run("cat", ["hello.txt"]);     <span class="c-cm">// ← sandboxd 通信層 (gRPC)</span>
+  console.log(r.stdout, r.exitCode);
+} finally {
+  await sandbox.close();                                          <span class="c-cm">// 接続を閉じて Claim を削除</span>
+}</code></pre>
+
+<h3 id="sdk-layers">2 層アーキテクチャ</h3>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph PUB["公開 API"]
+    SC["SandboxClient&lt;br/&gt;createSandbox / getSandbox / deleteSandbox&lt;br/&gt;listAllSandboxes / deleteAll / enableAutoCleanup"]
+    SB["Sandbox&lt;br/&gt;claimName / sandboxName / podName / podIP / serviceFQDN&lt;br/&gt;close() / closeLocal() / health() / metadata()"]
+    F["sandbox.files&lt;br/&gt;read / write / readStream / writeStream&lt;br/&gt;exists / list / delete"]
+    CM["sandbox.commands&lt;br/&gt;run(command, args, opts)"]
+  end
+
+  subgraph K8S["K8s リソース管理層（sandbox-client.ts）"]
+    COA["CustomObjectsApi&lt;br/&gt;SandboxClaim の POST / GET / DELETE"]
+    WT["k8s.Watch&lt;br/&gt;Claim → Sandbox の Ready 待ち"]
+    REG["registry / attaching / provisioning&lt;br/&gt;（ハンドル管理・single-flight）"]
+  end
+
+  subgraph CONN["sandboxd 通信層（sandbox.ts ほか）"]
+    GEN["ConnectionGeneration&lt;br/&gt;遅延接続・世代管理"]
+    STR["ConnectionStrategy&lt;br/&gt;(connection.ts)"]
+    TUN["PodTunnel&lt;br/&gt;(tunnel.ts)"]
+    REST["SandboxdRestClient&lt;br/&gt;fetch (rest.ts)"]
+    PROC["ProcessClient&lt;br/&gt;Connect-ES gRPC (process.ts)"]
+  end
+
+  SC --> COA
+  SC --> WT
+  SC --> REG
+  SC -- "Ready になったら生成" --> SB
+  SB --> F
+  SB --> CM
+  F --> GEN
+  CM --> GEN
+  GEN --> STR
+  STR -- "port-forward" --> TUN
+  GEN --> REST
+  GEN --> PROC
+</pre>
+<figcaption>図 12: SDK の 2 層構造。Sandbox ハンドルが 2 つの層の継ぎ目になる。</figcaption>
+</figure>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ファイル</th><th>層</th><th>責務</th></tr></thead>
+  <tbody>
+    <tr><td><code>sandbox-client.ts</code></td><td>K8s</td><td>Claim の作成・Ready 待ち（Watch）・削除、ハンドルのレジストリ、自動クリーンアップ</td></tr>
+    <tr><td><code>sandbox.ts</code></td><td>境界</td><td>Sandbox ハンドル。接続の遅延確立・世代管理、タイムアウト / 中断、close</td></tr>
+    <tr><td><code>files.ts</code> / <code>commands.ts</code></td><td>公開ファサード</td><td>公開型だけを使う薄いラッパー。実処理は Sandbox の private 実装に委譲</td></tr>
+    <tr><td><code>connection.ts</code></td><td>通信</td><td>接続方式（port-forward / in-cluster-service / in-cluster-pod-ip）の戦略</td></tr>
+    <tr><td><code>tunnel.ts</code></td><td>通信</td><td>ローカル TCP ⇔ apiserver の WebSocket port-forward のブリッジ</td></tr>
+    <tr><td><code>rest.ts</code></td><td>通信</td><td>REST クライアント（パス検証、サイズ上限、ストリーミング、エラー変換）</td></tr>
+    <tr><td><code>process.ts</code></td><td>通信</td><td>gRPC <code>Execute</code> クライアント（optional 依存の遅延ロード、RPC エラー変換）</td></tr>
+    <tr><td><code>exceptions.ts</code></td><td>共通</td><td><code>SandboxError</code> を頂点とするエラー階層</td></tr>
+    <tr><td><code>trace-manager.ts</code></td><td>共通</td><td>OpenTelemetry（任意）。パスやコマンド文字列は記録しない</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-k8s">K8s リソース管理層</h3>
+
+<p><code>createSandbox(warmpool)</code> は「Claim を作って、割り当てられた Sandbox が Ready になるまで待つ」処理です。<strong>この時点では sandboxd にはまだ接続しません。</strong></p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as アプリ
+  participant SC as SandboxClient
+  participant API as kube-apiserver
+  App->>SC: createSandbox("sandboxd-warmpool", ns, opts)
+  Note over SC: 引数検証 / claim 名 = sandbox-claim-{8桁hex}
+  Note over SC: attaching と provisioning に登録（single-flight）
+  SC->>API: POST SandboxClaim（warmPoolRef, 任意で lifecycle）
+  rect rgba(127,127,127,0.08)
+  Note over SC,API: Step 1: resolveSandboxName
+  loop status.sandbox.name が入るまで
+    SC->>API: GET SandboxClaim
+    SC->>API: WATCH SandboxClaim（resourceVersion から）
+    Note right of SC: Ready=False の終端理由&lt;br/&gt;(TemplateNotFound など) なら即失敗
+  end
+  end
+  rect rgba(127,127,127,0.08)
+  Note over SC,API: Step 2: watchForSandboxReady（残り時間で）
+  loop Ready=True になるまで
+    SC->>API: GET Sandbox
+    SC->>API: WATCH Sandbox
+  end
+  end
+  Note over SC: podName（pod-name アノテーション優先）/ podIP / serviceFQDN を取得
+  Note over SC: in-cluster 接続なら接続先の有無をここで検査
+  SC-->>App: new Sandbox(...)（まだ未接続）
+  Note over SC,API: 途中で失敗したら Claim を削除してロールバック（409 は他人の Claim なので削除しない）
+</pre>
+<figcaption>図 13: createSandbox の流れ。タイムアウトは sandboxReadyTimeout（秒、既定 180）が Step 1 + 2 全体に効く。</figcaption>
+</figure>
+
+<h4>Watch ループの作り</h4>
+<p>単に Watch するだけでなく、「GET してから Watch」「Watch が切れたら再 GET」を繰り返します。<code>@kubernetes/client-node</code> 2.x は 30 秒で Watch を打ち切るため、長い待ち時間でも確実に追従できるようにしています。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  G["GET（resourceVersion を得る）"] --> RD{"すでに条件を満たす？"}
+  RD -- "はい" --> DONE(["完了"])
+  RD -- "いいえ" --> DL{"期限切れ？"}
+  DL -- "はい" --> TO(["SandboxTimeoutError"])
+  DL -- "いいえ" --> W["WATCH（1 パス）"]
+  W -- "条件を満たすイベント" --> DONE
+  W -- "終端エラー / 404" --> ERR(["失敗を即返す"])
+  W -- "クリーンな終了&lt;br/&gt;(正常 close / 30s timeout / 410 Gone)" --> BO["バックオフ&lt;br/&gt;100ms → 最大 5s"]
+  BO --> G
+</pre>
+<figcaption>図 14: GET + WATCH の再試行ループ（Claim / Sandbox 共通の形）。</figcaption>
+</figure>
+
+<h4>ハンドルのレジストリと後片付け</h4>
+<ul>
+  <li><strong>single-flight:</strong> 同じ Claim に対する <code>getSandbox()</code> / <code>createSandbox()</code> の同時呼び出しは 1 つの Promise を共有し、ハンドルが二重にできないようにしている。</li>
+  <li><strong><code>sandbox.close()</code></strong> は実行中の操作を最大 5 秒待ってから接続を解放し、<strong>SandboxClaim を削除</strong>する（404 は成功扱い）。<code>closeLocal()</code> は接続だけ解放し Claim は残す。</li>
+  <li><strong><code>deleteAll()</code></strong> は作成途中の Claim まで含めて掃除する。POST と削除が競合しても、作成直後に気付いてロールバックする。</li>
+  <li><strong><code>enableAutoCleanup()</code></strong> は SIGINT / SIGTERM / <code>beforeExit</code> で <code>deleteAll()</code> を走らせ、シグナルを再送して終了する。</li>
+  <li><strong><code>shutdownAfterSeconds</code></strong> を渡すと Claim に絶対時刻の <code>lifecycle.shutdownTime</code> と <code>shutdownPolicy: Delete</code> を設定する。プロセスが落ちてもコントローラが後始末してくれる保険。</li>
+</ul>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-conn">sandboxd 通信層</h3>
+
+<p>Sandbox ハンドルは、最初に <code>files.*</code> / <code>commands.run()</code> / <code>health()</code> / <code>metadata()</code> が呼ばれた時点で<strong>遅延的に</strong>接続します。接続一式（トランスポート + REST クライアント + gRPC クライアント）は <strong>ConnectionGeneration（世代）</strong>としてまとめて扱われ、REST と gRPC は必ず同じ世代のものが使われます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  direction LR
+  [*] --> Disconnected
+  Disconnected --> Connecting: 最初の操作 / 次の操作
+  Connecting --> Connected: transport 確立 + /v1/health 200
+  Connecting --> Disconnected: 失敗・期限切れ（portForwardReadyTimeoutMs）
+  Connected --> Invalidated: SandboxConnectionError を検知
+  Invalidated --> Disconnected: 世代を破棄（同世代の実行中操作も失敗）
+  Connected --> Closed: close() / closeLocal()
+  Connecting --> Closed: close() / closeLocal()
+  Disconnected --> Closed: close() / closeLocal()
+  Closed --> [*]
+</pre>
+<figcaption>図 15: 接続の世代管理。自動リトライはせず、「次の呼び出し」が新しい世代で再接続する。</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Op as 操作 (files / run)
+  participant SB as Sandbox
+  participant ST as ConnectionStrategy
+  participant R as SandboxdRestClient
+  participant P as ProcessClient
+  Op->>SB: runOperation(timeoutMs, signal)
+  Note over SB: ensureConnected()（同時呼び出しは 1 つの接続を共有）
+  alt 現在の世代がない
+    SB->>ST: open()
+    ST-->>SB: transport（restBaseUrl / grpcBaseUrl）
+    loop 200ms 間隔（503 / 接続エラーのみ再試行）
+      SB->>R: GET /v1/health
+    end
+    Note right of SB: 401/403/404 の port-forward 拒否は終端エラー
+    SB->>P: new ProcessClient(grpcBaseUrl)
+    Note over SB: 新しい世代を current に
+  end
+  Note over SB: in-flight カウント++
+  SB->>R: REST 呼び出し（files / health / metadata）
+  SB->>P: または gRPC Execute（残り時間をデッドラインに）
+  Note over SB: in-flight カウント--（close() の drain 用）
+</pre>
+<figcaption>図 16: 遅延接続とヘルスチェック。gRPC 依存パッケージは ProcessClient の初回利用時に import される。</figcaption>
+</figure>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-connectivity">接続方式（connectivity）</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>値</th><th>経路</th><th>要件</th><th>向いている場面</th></tr></thead>
+  <tbody>
+    <tr><td><code>"port-forward"</code>（既定）</td><td>apiserver 経由の WebSocket port-forward</td><td>kubeconfig と <code>pods/portforward</code> 権限</td><td>ラップトップ、CI、クラスタ外全般</td></tr>
+    <tr><td><code>"in-cluster-service"</code></td><td>headless Service の DNS 名（<code>status.serviceFQDN</code>）へ直接</td><td>クラスタ内で実行 + テンプレートに <code>service: true</code> + NetworkPolicy で許可</td><td>クラスタ内のワーカー。信頼境界を越える場合の推奨</td></tr>
+    <tr><td><code>"in-cluster-pod-ip"</code></td><td>Pod IP（<code>status.podIPs</code>、IPv4 優先）へ直接</td><td>クラスタ内で実行 + NetworkPolicy で許可</td><td>Service を作れない場合。IP 再利用のリスクあり</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph PF["port-forward（既定）"]
+    direction LR
+    A1["SDK"] -- "HTTP / HTTP2" --> L1["127.0.0.1:ランダム&lt;br/&gt;REST 用 / gRPC 用"]
+    L1 -- "WebSocket&lt;br/&gt;(TCP 接続ごとに 1 本)" --> K1["kube-apiserver&lt;br/&gt;/pods/NAME/portforward"]
+    K1 --> KL["kubelet"] --> D1["sandboxd&lt;br/&gt;:8080 / :9090"]
+  end
+  subgraph SVC["in-cluster-service"]
+    direction LR
+    A2["SDK（クラスタ内 Pod）"] -- "平文 HTTP / h2c" --> S2["NAME.ns.svc.cluster.local&lt;br/&gt;(headless Service)"] --> D2["sandboxd"]
+  end
+  subgraph IP["in-cluster-pod-ip"]
+    direction LR
+    A3["SDK（クラスタ内 Pod）"] -- "平文 HTTP / h2c" --> D3["Pod IP:8080 / :9090"]
+  end
+  PF ~~~ SVC ~~~ IP
+</pre>
+<figcaption>図 17: 3 つの接続方式。in-cluster の 2 つはフォールバックせず、使う宛先は常に 1 つ。</figcaption>
+</figure>
+
+<h4>PodTunnel の仕組み（port-forward）</h4>
+<p><code>PodTunnel</code> は <code>127.0.0.1</code> のランダムポートで REST 用・gRPC 用の 2 つの TCP リスナーを開き、<strong>受け付けた TCP 接続 1 本ごとに apiserver への WebSocket を 1 本張って</strong>中継します。上位の <code>fetch</code> や Connect-ES からは普通のローカルサーバーに見えるので、HTTP/2（gRPC）もそのまま通ります。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant H as fetch / HTTP2 クライアント
+  participant L as ローカル TCP リスナー
+  participant T as PodTunnel
+  participant K as kube-apiserver
+  participant D as sandboxd
+  H->>L: TCP 接続
+  L->>T: accept（ソケットを pause）
+  T->>K: WebSocket upgrade&lt;br/&gt;/api/v1/namespaces/NS/pods/POD/portforward?ports=8080
+  K-->>T: 101 Switching Protocols（channel 0 = data, 1 = error）
+  Note over T: 各チャネル先頭 2 バイトのポート番号ヘッダを除去
+  T->>L: ソケットを resume してポンプ開始
+  loop 双方向（1 MiB でバックプレッシャ）
+    H->>T: バイト列
+    T->>K: channel 0 フレーム
+    K->>D: TCP
+    D-->>K: 応答
+    K-->>T: channel 0 フレーム
+    T-->>H: バイト列
+  end
+  Note over T,K: error チャネルに中身が来たら（最大 4 KiB 保持）そのペアを破棄
+</pre>
+<figcaption>図 18: PodTunnel による TCP ⇔ WebSocket の中継。</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p><strong>信頼境界:</strong> ローカルリスナー自体に認証はありません。接続が開いている間、同じネットワーク名前空間の他プロセスもそのポート経由で sandbox を操作できます。in-cluster モードでは REST / gRPC が平文で Pod ネットワークを流れるので、NetworkPolicy やサービスメッシュで守ってください。</p>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-ops">操作の実行とエラー</h3>
+
+<h4>1 回の呼び出しに何が起きるか</h4>
+<p>すべてのランタイム呼び出しは <code>runOperation()</code> を通ります。<code>timeoutMs</code>（既定 60 秒）は<strong>接続待ちも含めた総予算</strong>で、タイムアウト・ハンドルの close・利用者の <code>AbortSignal</code>・世代の無効化を <code>AbortSignal.any()</code> で 1 つにまとめます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  IN(["files.write() / commands.run() など"]) --> V["入力をクライアント側で検証&lt;br/&gt;（パス: 絶対パス・.. を拒否 / argv・env・cwd の型）"]
+  V --> SIG["signal = any(タイムアウト, lifecycle, 利用者 signal)"]
+  SIG --> EC["ensureConnected()"]
+  EC --> CALL["REST または gRPC を呼ぶ&lt;br/&gt;signal に世代の abort も合成"]
+  CALL -- "成功" --> OK(["結果を返す"])
+  CALL -- "失敗" --> CL{"原因の分類"}
+  CL -- "タイムアウト" --> E1["SandboxTimeoutError"]
+  CL -- "close 済み" --> E2["SandboxClosedError"]
+  CL -- "利用者が中断" --> E3["signal.reason"]
+  CL -- "SandboxConnectionError" --> E4["世代を無効化して再送出&lt;br/&gt;（次の呼び出しで再接続）"]
+  CL -- "API / RPC エラー" --> E5["SandboxdApiError / SandboxdRpcError"]
+</pre>
+<figcaption>図 19: runOperation とエラー分類。どの失敗も SDK は自動リトライしない。</figcaption>
+</figure>
+
+<h4>files と commands の違い</h4>
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th><code>sandbox.files.*</code></th><th><code>sandbox.commands.run()</code></th></tr></thead>
+  <tbody>
+    <tr><td>プロトコル</td><td>REST（Node 組み込み <code>fetch</code>）</td><td>gRPC <code>Execute</code>（Connect-ES、HTTP/2）</td></tr>
+    <tr><td>追加依存</td><td>不要</td><td><code>@bufbuild/protobuf</code>, <code>@connectrpc/connect</code>, <code>@connectrpc/connect-node</code></td></tr>
+    <tr><td>サイズ上限</td><td><code>maxDownloadSize</code> / <code>maxUploadSize</code>（各 256 MiB、ストリーム中に逐次チェック）</td><td><code>maxCommandOutputSize</code>（4 MiB、stdout + stderr + protobuf 全体）</td></tr>
+    <tr><td>入力の扱い</td><td>ルート相対の POSIX パス。絶対パスと <code>..</code> は送信前に拒否</td><td>argv そのまま。シェルは挟まない（必要なら <code>run("sh", ["-c", "..."])</code>）</td></tr>
+    <tr><td>結果</td><td><code>Uint8Array</code> / <code>ReadableStream</code> / <code>DirectoryListing</code> など</td><td><code>{ stdout, stderr, exitCode }</code>。非 0 の exitCode はエラーではない</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>エラー階層</h4>
+<figure class="diagram">
+<pre class="mermaid">
+classDiagram
+  direction LR
+  class SandboxError
+  class SandboxNotFoundError
+  class SandboxMetadataError
+  class SandboxNoServiceError
+  class SandboxTimeoutError
+  class SandboxTemplateNotFoundError
+  class SandboxWarmPoolNotFoundError
+  class SandboxClaimFailedError
+  class SandboxClosedError
+  class SandboxConnectionError {
+    kind: SandboxConnectionErrorKind
+  }
+  class SandboxdApiError {
+    status: number
+    code: SandboxdApiCode
+  }
+  class SandboxdRpcError {
+    code: string
+  }
+  SandboxError &lt;|-- SandboxNotFoundError
+  SandboxError &lt;|-- SandboxMetadataError
+  SandboxError &lt;|-- SandboxNoServiceError
+  SandboxError &lt;|-- SandboxTimeoutError
+  SandboxError &lt;|-- SandboxTemplateNotFoundError
+  SandboxError &lt;|-- SandboxWarmPoolNotFoundError
+  SandboxError &lt;|-- SandboxClaimFailedError
+  SandboxError &lt;|-- SandboxClosedError
+  SandboxError &lt;|-- SandboxConnectionError
+  SandboxError &lt;|-- SandboxdApiError
+  SandboxError &lt;|-- SandboxdRpcError
+</pre>
+<figcaption>図 20: エラー階層。SandboxConnectionError / SandboxdApiError / SandboxdRpcError が sandboxd 通信層由来で、それ以外は主に K8s リソース管理層やハンドルの状態に由来する。</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="e2e"><span class="num">5.</span>エンドツーエンドで見る</h2>
+
+<p>ここまでの要素を 1 本につなげると、<code>createSandbox → files.write → commands.run → close</code> は次のようになります（port-forward の場合）。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as アプリ
+  participant SDK as SDK
+  participant API as kube-apiserver
+  participant CTL as controller
+  participant D as sandboxd (Pod)
+
+  App->>SDK: createSandbox("sandboxd-warmpool")
+  SDK->>API: POST SandboxClaim
+  API-->>CTL: Claim 追加
+  CTL->>API: プールの Sandbox を採用 / status 更新
+  SDK->>API: GET + WATCH（Claim → Sandbox Ready）
+  SDK-->>App: Sandbox ハンドル（未接続）
+
+  App->>SDK: files.write("a.txt", "hi")
+  Note over SDK: PodTunnel 起動（127.0.0.1 × 2）
+  SDK->>API: WebSocket portforward
+  API->>D: GET /v1/health
+  D-->>SDK: 200 ok
+  SDK->>D: PUT /v1/files/a.txt
+  D-->>SDK: 204
+
+  App->>SDK: commands.run("cat", ["a.txt"])
+  Note over SDK: gRPC 依存を遅延 import、HTTP/2 セッション作成
+  SDK->>D: ProcessService.Execute（同じ世代・同じトンネル）
+  D-->>SDK: stdout "hi" / exitCode 0
+  SDK-->>App: ExecutionResult
+
+  App->>SDK: close()
+  Note over SDK: in-flight を drain、トンネルを閉じる
+  SDK->>API: DELETE SandboxClaim
+  API-->>CTL: Claim 削除 → Sandbox / Pod もカスケード削除
+</pre>
+<figcaption>図 21: 一連の流れ。コントロールプレーンとデータプレーンが交互に登場する。</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="demos"><span class="num">6.</span>このリポジトリのデモ</h2>
+
+<p><a href="https://github.com/khirotaka/try-agent-sandbox-ts">try-agent-sandbox-ts</a> では、同じ SandboxTemplate / WarmPool に対して 2 つの接続方式を試せます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph HOST["ローカルマシン"]
+    PG["playground/&lt;br/&gt;task playground:run&lt;br/&gt;(port-forward)"]
+  end
+  subgraph KIND["kind クラスタ"]
+    API[("kube-apiserver")]
+    subgraph NS["namespace: default"]
+      JOB["sandbox-job Pod&lt;br/&gt;label app=sandbox-job&lt;br/&gt;(in-cluster-service)"]
+      NP{{"NetworkPolicy&lt;br/&gt;ingress: app=sandbox-job&lt;br/&gt;TCP 8080 / 9090 のみ"}}
+      subgraph SBX["Sandbox Pod（sandboxd-template）"]
+        D["sandboxd&lt;br/&gt;runAsNonRoot / drop ALL"]
+      end
+      SVC["headless Service&lt;br/&gt;(service: true)"]
+    end
+  end
+  PG -- "kubeconfig" --> API
+  API -- "port-forward&lt;br/&gt;（NetworkPolicy の対象外）" --> D
+  JOB -- "Claim 作成 (RBAC: Role)" --> API
+  JOB -- "DNS" --> SVC
+  SVC --> NP --> D
+</pre>
+<figcaption>図 22: playground（クラスタ外）と sandbox-job（クラスタ内）の経路の違い。</figcaption>
+</figure>
+
+<ul>
+  <li><strong>playground</strong>（<code>playground/index.ts</code>）: kubeconfig だけで動く。health / metadata、argv 実行、env / cwd、非 0 終了、存在しないコマンド、files の各操作、パス閉じ込め、SandboxClient の一覧・削除 API を一通り試す。</li>
+  <li><strong>sandbox-job</strong>（<code>sandbox-job/</code>）: Kubernetes Job として Claim を作り、headless Service 経由で sandboxd に直接つなぐ。テンプレートの <code>networkPolicy</code> が <code>app: sandbox-job</code> からの 8080/9090 だけを許可している点がポイント（既定の NetworkPolicy は sandbox-router しか通さず、router は gRPC を中継できないため）。</li>
+</ul>
+
+<pre class="code"><code>task cluster:create    <span class="c-cm"># kind + controller v1.0.4 + sandboxd イメージ + Template/WarmPool</span>
+task playground:run    <span class="c-cm"># クラスタ外から port-forward で</span>
+task job:run           <span class="c-cm"># クラスタ内から in-cluster-service で</span>
+task cluster:delete</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="references"><span class="num">7.</span>参考リンク</h2>
+<ul>
+  <li><a href="https://github.com/kubernetes-sigs/agent-sandbox">kubernetes-sigs/agent-sandbox</a>（upstream）/ <a href="https://agent-sandbox.sigs.k8s.io">agent-sandbox.sigs.k8s.io</a></li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox">khirotaka/agent-sandbox</a>（TypeScript SDK を含む fork）</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/clients/typescript/agentic-sandbox-client">clients/typescript/agentic-sandbox-client</a> — SDK のソースと README</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/blob/7d97d6e52832f95d1fb7e87078f324ae486d180b/packages/sandboxd/USER_GUIDE.md">packages/sandboxd/USER_GUIDE.md</a> — sandboxd のユーザーガイド</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/packages/sandboxd/spec">packages/sandboxd/spec</a> — <code>process.proto</code> と <code>filesystem.yaml</code>（OpenAPI）</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/api/v1beta1">api/v1beta1</a> / <a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/extensions/api/v1beta1">extensions/api/v1beta1</a> — CRD の型定義</li>
+</ul>
+
+<footer class="site-footer">
+  <p>非公式の解説です。内容は khirotaka/agent-sandbox のコミット <code>7d97d6e</code> と agent-sandbox controller v1.0.4 に基づきます。誤りに気付いたら <a href="https://github.com/khirotaka/try-agent-sandbox-ts/issues">issue</a> でお知らせください。</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
