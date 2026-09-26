@@ -10,6 +10,8 @@ The client talks to [sandboxd](https://github.com/kubernetes-sigs/agent-sandbox/
 
 https://github.com/user-attachments/assets/8ad9504f-95ce-4b15-a15b-e55f1c9ab5b9
 
+An unofficial, diagram-heavy explainer (日本語 / English) of the four CRDs, sandboxd, and the TypeScript SDK internals is published with GitHub Pages from [docs/](docs/): <https://khirotaka.github.io/try-agent-sandbox-ts/>
+
 ## Prerequisites
 
 | Tool | Version |
@@ -110,6 +112,7 @@ task cluster:delete
 ├── agent-sandbox/      # Submodule — khirotaka/agent-sandbox (fork of kubernetes-sigs/agent-sandbox)
 │   ├── clients/typescript/agentic-sandbox-client/   # TypeScript client source
 │   └── packages/sandboxd/                           # sandboxd runtime daemon (image built from here)
+├── docs/               # GitHub Pages explainer (ja: docs/index.html, en: docs/en/index.html)
 ├── manifests/          # SandboxTemplate (sandboxd + NetworkPolicy) and SandboxWarmPool
 ├── playground/         # Interactive demo — runs locally via tsx (port-forward connectivity)
 ├── sandbox-job/        # Kubernetes Job demo — runs inside the cluster (in-cluster-service connectivity)

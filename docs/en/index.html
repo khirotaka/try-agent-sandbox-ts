@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Sandbox Explained</title>
+<meta name="description" content="An unofficial, diagram-heavy guide to Agent Sandbox's four CRDs, the in-sandbox runtime sandboxd, and how the TypeScript SDK splits Kubernetes resource management from sandboxd communication.">
+<link rel="alternate" hreflang="ja" href="../">
+<link rel="alternate" hreflang="en" href="./">
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  try {
+    var t = localStorage.getItem("as-doc-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<script type="module" src="../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <button class="toc-toggle" type="button" aria-label="Contents">☰</button>
+  <a class="site-title" href="./">Agent Sandbox Explained (unofficial)</a>
+  <span class="header-spacer"></span>
+  <nav class="lang-tabs" aria-label="Language">
+    <a href="../" data-lang="ja">日本語</a>
+    <a href="./" data-lang="en" aria-current="page">English</a>
+  </nav>
+  <button class="theme-toggle" type="button" aria-label="Toggle theme">☾</button>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <p class="toc-title">Contents</p>
+  <ol>
+    <li><a href="#overview">0. Introduction</a></li>
+    <li><a href="#big-picture">1. The big picture</a></li>
+    <li><a href="#crds">2. The four CRDs</a>
+      <ol>
+        <li><a href="#crd-sandbox">Sandbox</a></li>
+        <li><a href="#crd-template">SandboxTemplate</a></li>
+        <li><a href="#crd-warmpool">SandboxWarmPool</a></li>
+        <li><a href="#crd-claim">SandboxClaim</a></li>
+        <li><a href="#crd-flow">From Claim to Sandbox</a></li>
+      </ol>
+    </li>
+    <li><a href="#sandboxd">3. sandboxd</a>
+      <ol>
+        <li><a href="#sandboxd-api">API (gRPC + REST)</a></li>
+        <li><a href="#sandboxd-internals">Internals</a></li>
+        <li><a href="#sandboxd-topology">Deployment topologies</a></li>
+        <li><a href="#sandboxd-security">Security model</a></li>
+      </ol>
+    </li>
+    <li><a href="#sdk">4. TypeScript SDK</a>
+      <ol>
+        <li><a href="#sdk-layers">Two-layer architecture</a></li>
+        <li><a href="#sdk-k8s">K8s resource layer</a></li>
+        <li><a href="#sdk-conn">sandboxd communication layer</a></li>
+        <li><a href="#sdk-connectivity">Connectivity modes</a></li>
+        <li><a href="#sdk-ops">Operations and errors</a></li>
+      </ol>
+    </li>
+    <li><a href="#e2e">5. End to end</a></li>
+    <li><a href="#demos">6. Demos in this repo</a></li>
+    <li><a href="#references">7. References</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section class="hero" id="overview">
+  <h1>How Agent Sandbox and its TypeScript SDK work</h1>
+  <p class="lede"><a href="https://github.com/kubernetes-sigs/agent-sandbox">kubernetes-sigs/agent-sandbox</a> provides isolated execution environments for AI agents on Kubernetes. This guide walks through its four CRDs, the in-pod runtime <code>sandboxd</code>, and the internals of the TypeScript SDK, mostly through diagrams.</p>
+  <div class="badges">
+    <span class="badge">controller v1.0.4</span>
+    <span class="badge">API v1beta1</span>
+    <span class="badge">fork: khirotaka/agent-sandbox @ 7d97d6e</span>
+  </div>
+</section>
+
+<div class="callout warn">
+  <p><strong>This is unofficial.</strong> The TypeScript SDK (<code>agentic-sandbox-client</code>) lives only in the <a href="https://github.com/khirotaka/agent-sandbox">khirotaka/agent-sandbox</a> fork and, at the time of writing, has not been merged into upstream kubernetes-sigs/agent-sandbox. Its API and behavior may change without notice. Everything here is based on the source at the commit this repository's submodule points to.</p>
+</div>
+
+<p>This guide answers three questions:</p>
+<ol>
+  <li>What do the <strong>four CRDs</strong> (Sandbox / SandboxTemplate / SandboxWarmPool / SandboxClaim) each represent, and how do they fit together?</li>
+  <li>What does <strong>sandboxd</strong> do inside the pod?</li>
+  <li>How does the <strong>TypeScript SDK</strong> implement "managing K8s resources" and "talking to sandboxd"?</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="big-picture"><span class="num">1.</span>The big picture</h2>
+
+<p>Agent Sandbox splits cleanly into a <strong>control plane</strong> (which pod to prepare, and when) and a <strong>data plane</strong> (file operations and command execution inside that pod). The SDK is split into two layers along the same boundary.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph APP["App / agent (Node.js)"]
+    direction LR
+    SC["SandboxClient"] ~~~ SB["Sandbox handle&lt;br/&gt;.files / .commands"]
+  end
+
+  subgraph CP["Control plane"]
+    direction LR
+    API[("kube-apiserver")] &lt;--> CTRL["agent-sandbox-controller&lt;br/&gt;(four reconcilers)"]
+  end
+
+  subgraph POD["Sandbox Pod"]
+    direction LR
+    D["sandboxd&lt;br/&gt;REST :8080 / gRPC :9090"] --- WS[("/workspace")]
+  end
+
+  SC -- "① create and watch a SandboxClaim" --> API
+  CTRL -- "② provision Pod / Service / NetworkPolicy" --> POD
+  SB -- "③ files (REST) / commands (gRPC)" --> D
+</pre>
+<figcaption>Figure 1: The big picture. ① and ② are Kubernetes resource management; ③ is sandboxd communication.</figcaption>
+</figure>
+
+<div class="cards">
+  <div class="card"><div class="card-kicker">control plane</div><div class="card-title">CRDs + controllers</div><p>Declaratively manage what kind of pod to run, how many to keep warm, and who gets one.</p></div>
+  <div class="card"><div class="card-kicker">data plane</div><div class="card-title">sandboxd</div><p>A daemon inside the pod serving a files API (REST) and a process API (gRPC).</p></div>
+  <div class="card"><div class="card-kicker">client</div><div class="card-title">TypeScript SDK</div><p>Wraps claim creation, readiness waiting, deletion, and the sandboxd connection into a single handle.</p></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="crds"><span class="num">2.</span>The four CRDs</h2>
+
+<p>The CRDs live in two API groups. The core group <code>agents.x-k8s.io</code> contains only <strong>Sandbox</strong>, which on its own is enough to describe one isolated environment. The other three live in <code>extensions.agents.x-k8s.io</code> and layer the operational machinery on top of Sandbox: <strong>templating, pre-warming, and handing sandboxes out</strong>.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Kind</th><th>API group</th><th>In one line</th><th>Usually created by</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Sandbox</strong></td><td><code>agents.x-k8s.io</code></td><td>One isolated environment (a Pod plus optional Service / PVCs)</td><td>The WarmPool / Claim controllers (or directly)</td></tr>
+    <tr><td><strong>SandboxTemplate</strong></td><td><code>extensions.agents.x-k8s.io</code></td><td>Blueprint for a Sandbox + NetworkPolicy + what a claim may override</td><td>Platform admins</td></tr>
+    <tr><td><strong>SandboxWarmPool</strong></td><td><code>extensions.agents.x-k8s.io</code></td><td>A pool that keeps N sandboxes from a template running in advance</td><td>Platform admins</td></tr>
+    <tr><td><strong>SandboxClaim</strong></td><td><code>extensions.agents.x-k8s.io</code></td><td>A request: "give me one from this pool"</td><td>Apps / the SDK</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  T["SandboxTemplate&lt;br/&gt;podTemplate / networkPolicy / override policies"]
+  WP["SandboxWarmPool&lt;br/&gt;replicas / sandboxTemplateRef"]
+  C["SandboxClaim&lt;br/&gt;warmPoolRef / lifecycle"]
+  NP["NetworkPolicy&lt;br/&gt;(one shared per template)"]
+
+  subgraph POOL["Owned by the pool (unclaimed)"]
+    S1["Sandbox"]
+    S2["Sandbox"]
+  end
+  S3["Sandbox (owned by the claim)"]
+
+  subgraph RES["Child resources owned by the Sandbox"]
+    P["Pod"]
+    SVC["headless Service&lt;br/&gt;(if service: true)"]
+    PVC["PVCs&lt;br/&gt;(volumeClaimTemplates)"]
+  end
+
+  WP -- "references" --> T
+  C -- "references" --> WP
+  T -. "creates / manages" .-> NP
+  WP -- "creates / replenishes" --> S1
+  WP -- "creates / replenishes" --> S2
+  C -- "adopts or cold-creates" --> S3
+  S3 --> P
+  S3 --> SVC
+  S3 --> PVC
+</pre>
+<figcaption>Figure 2: How the CRDs relate. Ownership of a Sandbox moves from the WarmPool to the Claim the moment it is adopted.</figcaption>
+</figure>
+
+<div class="callout">
+  <p><strong>Analogy:</strong> SandboxTemplate is the "class definition", SandboxWarmPool is a "pre-warmed ReplicaSet", and SandboxClaim relates to Sandbox much like a <em>PersistentVolumeClaim relates to a PersistentVolume</em>. Users write only the claim; the controller binds it to an actual Sandbox.</p>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="crd-sandbox">Sandbox (<code>agents.x-k8s.io/v1beta1</code>)</h3>
+
+<p>The core resource. It represents <strong>a stateful, singleton pod</strong>: not a set of replicas like a Deployment, but exactly one pod per Sandbox, with a stable name, storage, and network identity.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>spec.podTemplate</code></td><td>Spec, labels, and annotations for the pod to create</td></tr>
+    <tr><td><code>spec.volumeClaimTemplates</code></td><td>Templates for PVCs created for the sandbox</td></tr>
+    <tr><td><code>spec.service</code></td><td><code>true</code> creates a headless Service (<code>ClusterIP: None</code>). When unset, no new Service is created</td></tr>
+    <tr><td><code>spec.operatingMode</code></td><td><code>Running</code> (default) / <code>Suspended</code>. Suspended stops the pod but keeps the Sandbox and its volumes</td></tr>
+    <tr><td><code>spec.shutdownTime</code> / <code>shutdownPolicy</code></td><td>At the deadline the pod and service are deleted. The Sandbox itself is kept with <code>Retain</code> (default) or removed with <code>Delete</code></td></tr>
+    <tr><td><code>status.conditions[Ready]</code></td><td>True only once the pod is actually Running and Ready</td></tr>
+    <tr><td><code>status.podIPs</code> / <code>serviceFQDN</code> / <code>nodeName</code></td><td>Where to reach it. The SDK's in-cluster modes read these</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  direction LR
+  [*] --> Pending: Sandbox created
+  Pending --> Ready: pod Running and Ready
+  Ready --> Suspended: operatingMode = Suspended
+  Suspended --> Pending: operatingMode = Running
+  Ready --> Expired: shutdownTime reached
+  Pending --> Expired: shutdownTime reached
+  Expired --> [*]: shutdownPolicy = Delete
+  Expired --> Expired: Retain (Ready=False / SandboxExpired)
+  note right of Suspended
+    The pod is deleted but
+    the Sandbox and PVCs remain
+  end note
+</pre>
+<figcaption>Figure 3: Sandbox states (conceptual). The Ready condition is the only authoritative "usable now" signal.</figcaption>
+</figure>
+
+<p><code>operatingMode</code> declares <em>intent</em>; the observed state is the <code>Ready</code> condition. The SDK waits for <code>Ready=True</code> before handing back a handle.</p>
+
+<!-- ------------------------------ -->
+<h3 id="crd-template">SandboxTemplate (<code>extensions.agents.x-k8s.io/v1beta1</code>)</h3>
+
+<p>The blueprint for a Sandbox. It embeds the same <code>SandboxBlueprint</code> as Sandbox (podTemplate / volumeClaimTemplates / service) and adds <strong>network isolation</strong> and <strong>how much a claim may override</strong>.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>networkPolicyManagement</code></td><td><code>Managed</code></td><td>Managed: the controller maintains one shared NetworkPolicy per template. <code>Unmanaged</code>: none is created (leave it to Cilium etc.)</td></tr>
+    <tr><td><code>networkPolicy</code></td><td>(secure default)</td><td>When omitted: ingress only from the sandbox-router, egress to the public internet only (RFC1918, the metadata server, etc. are blocked). When set, it <strong>replaces the defaults entirely</strong></td></tr>
+    <tr><td><code>envVarsInjectionPolicy</code></td><td><code>Disallowed</code></td><td>Whether a claim may set <code>spec.env</code> (<code>Allowed</code>: add only / <code>Overrides</code>: add and override)</td></tr>
+    <tr><td><code>volumeClaimTemplatesPolicy</code></td><td><code>Disallowed</code></td><td>Whether a claim may add or override PVC templates</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Pods created through a template also get <code>automountServiceAccountToken: false</code> when it isn't set. The design is secure by default, on the assumption that the sandbox runs untrusted code.</p>
+
+<!-- ------------------------------ -->
+<h3 id="crd-warmpool">SandboxWarmPool (<code>extensions.agents.x-k8s.io/v1beta1</code>)</h3>
+
+<p>To hide image pulls and start-up time from users, the pool <strong>keeps <code>replicas</code> sandboxes running ahead of time</strong>. When a claim adopts one, ownership moves to the claim and the pool automatically replenishes. The pool can also be scaled by an HPA.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph WP["SandboxWarmPool (replicas: 3)"]
+    A["Sandbox A&lt;br/&gt;Ready"]
+    B["Sandbox B&lt;br/&gt;Ready"]
+    Cc["Sandbox C&lt;br/&gt;starting"]
+  end
+  CL["SandboxClaim"] -- "adopt (ownerRef moves)" --> A
+  A -. "leaves the pool" .-> OUT["Sandbox A, owned by the claim"]
+  WP -- "replenish" --> N["new Sandbox D"]
+</pre>
+<figcaption>Figure 4: Adoption and replenishment. Ready candidates are preferred.</figcaption>
+</figure>
+
+<p>What happens to old sandboxes when the template changes is decided by <code>updateStrategy</code>:</p>
+<ul>
+  <li><strong><code>OnReplenish</code> (default)</strong>: stale unclaimed sandboxes stay; they are replaced once deleted manually or adopted by a claim.</li>
+  <li><strong><code>Recreate</code></strong>: stale unclaimed sandboxes are deleted immediately, so the pool only holds sandboxes matching the current template.</li>
+</ul>
+<p>Neither strategy <strong>ever touches a sandbox already assigned to a claim</strong>.</p>
+
+<!-- ------------------------------ -->
+<h3 id="crd-claim">SandboxClaim (<code>extensions.agents.x-k8s.io/v1beta1</code>)</h3>
+
+<p>This is what an app (or the SDK) actually creates. It says which pool to draw from and for how long.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>spec.warmPoolRef.name</code></td><td>The pool to draw from (required)</td></tr>
+    <tr><td><code>spec.lifecycle.shutdownTime</code></td><td>The claim's deadline. When reached, the controller deletes the underlying Sandbox</td></tr>
+    <tr><td><code>spec.lifecycle.shutdownPolicy</code></td><td><code>Retain</code> (default) / <code>Delete</code> / <code>DeleteForeground</code> (the claim stays until its Sandbox and Pod are fully gone)</td></tr>
+    <tr><td><code>spec.lifecycle.ttlSecondsAfterFinished</code></td><td>How long a finished claim is kept</td></tr>
+    <tr><td><code>spec.additionalPodMetadata</code></td><td>Labels / annotations propagated to the pod (allow-listed domains only)</td></tr>
+    <tr><td><code>spec.env</code> / <code>spec.volumeClaimTemplates</code></td><td>Allowed only if the template's policies permit. <strong>Setting either skips the warm pool and forces a cold start</strong></td></tr>
+    <tr><td><code>status.sandbox.name</code></td><td>The assigned Sandbox. The SDK waits for this first</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <p><strong>Why does setting env force a cold start?</strong> Environment variables are baked into a pod when it is created; they cannot be injected into a pool pod that is already running.</p>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="crd-flow">From Claim to Sandbox</h3>
+
+<p>The SandboxClaim controller first tries a <strong>fast path</strong> ("find the existing Sandbox, or adopt one from the pool"). Only if there is no candidate does it take the <strong>cold path</strong> and create a new Sandbox from the template.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S(["Reconcile SandboxClaim"]) --> E{"Expired?"}
+  E -- "yes" --> X["Delete the Sandbox and&lt;br/&gt;apply shutdownPolicy"]
+  E -- "no" --> F{"Already has an&lt;br/&gt;assigned Sandbox?"}
+  F -- "yes" --> M["Sync metadata"]
+  F -- "no" --> Q{"No env / PVCs and&lt;br/&gt;the pool has a candidate?"}
+  Q -- "yes" --> R{"A Ready candidate?"}
+  R -- "yes" --> AD["Adopt it (fast path)"]
+  R -- "no" --> FB["Adopt a not-yet-Ready&lt;br/&gt;candidate as a fallback"]
+  Q -- "no" --> CO["Fetch the template and&lt;br/&gt;create a Sandbox (cold path)"]
+  AD --> ST["Update status.sandbox.name etc."]
+  FB --> ST
+  CO --> ST
+  M --> ST
+</pre>
+<figcaption>Figure 5: SandboxClaim controller decisions (simplified). Under Recreate, stale candidates are skipped.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as App / SDK
+  participant API as kube-apiserver
+  participant CC as Claim controller
+  participant WPC as WarmPool controller
+  participant SC as Sandbox controller
+
+  Note over WPC,SC: Beforehand: the pool created replicas Sandboxes and their pods are running
+  U->>API: create SandboxClaim
+  API-->>CC: change event
+  CC->>API: adopt a Ready pool Sandbox (ownerRef to the claim)
+  CC->>API: set Claim.status.sandbox.name
+  API-->>WPC: the pool shrank
+  WPC->>API: create a replacement Sandbox
+  API-->>SC: new Sandbox
+  SC->>API: create Pod (and Service / PVCs)
+  U->>API: watch until the Sandbox is Ready=True
+</pre>
+<figcaption>Figure 6: Handing out a sandbox on the warm path. The user only waits for adoption; replenishment happens in the background.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="sandboxd"><span class="num">3.</span>sandboxd: the in-pod runtime daemon</h2>
+
+<p><code>sandboxd</code> (<code>packages/sandboxd</code>) is a Go daemon that runs inside the sandbox pod. It is the <strong>reference implementation of the portable runtime API</strong> defined by KEP-539.2 (runtime standardization). The SDKs depend on that <strong>wire contract</strong> (a proto file and an OpenAPI document), not on the sandboxd binary itself.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  CL["Client&lt;br/&gt;(SDK / curl / grpcurl)"]
+  subgraph POD["Sandbox Pod"]
+    subgraph C["sandboxd container"]
+      G["gRPC :9090&lt;br/&gt;ProcessService"]
+      R["HTTP :8080&lt;br/&gt;Filesystem / health / metadata"]
+      PM["ProcessRegistry"]
+      PU["pathutil.SanitizePath"]
+      CH["child processes&lt;br/&gt;(one process group each)"]
+    end
+    W[("/workspace&lt;br/&gt;--root-dir")]
+  end
+  CL -- "HTTP/2 gRPC" --> G
+  CL -- "HTTP/1.1 REST" --> R
+  G --> PM --> CH
+  G -- "validate cwd" --> PU
+  R -- "validate path" --> PU
+  PU --> W
+  CH -- "cwd under /workspace" --> W
+</pre>
+<figcaption>Figure 7: Inside sandboxd. A file written over REST is visible to a process started over gRPC (same root).</figcaption>
+</figure>
+
+<h3 id="sandboxd-api">API (a gRPC + REST hybrid)</h3>
+
+<p>Why two protocols?</p>
+<ul>
+  <li><strong>Process execution uses gRPC.</strong> <code>Start</code> is a server-streaming RPC that keeps sending stdout/stderr until the process exits, which maps naturally onto an HTTP/2 stream.</li>
+  <li><strong>File transfer uses REST.</strong> File bytes travel as raw <code>application/octet-stream</code> with no protobuf wrapping, and plain curl works without generated stubs.</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th colspan="3">ProcessService (gRPC :9090)</th></tr><tr><th>RPC</th><th>Type</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>Execute</code></td><td>Unary</td><td>Run synchronously and return stdout / stderr / exit_code at once (<strong>what the TS SDK's <code>run()</code> uses</strong>)</td></tr>
+    <tr><td><code>Start</code></td><td>Server stream</td><td>Stream InitEvent → output chunks → ExitEvent. PTY support</td></tr>
+    <tr><td><code>WriteStdin</code></td><td>Unary</td><td>Send stdin bytes / EOF to a running process</td></tr>
+    <tr><td><code>SendSignal</code></td><td>Unary</td><td>SIGINT / SIGTERM / SIGKILL to the process group</td></tr>
+    <tr><td><code>ResizeTTY</code></td><td>Unary</td><td>Resize the PTY</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th colspan="3">Filesystem &amp; Runtime REST API (HTTP :8080)</th></tr><tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET</code></td><td><code>/v1/files/{path}</code></td><td>Raw bytes for a file, a JSON listing for a directory</td></tr>
+    <tr><td><code>HEAD</code></td><td><code>/v1/files/{path}</code></td><td>Existence check, no body</td></tr>
+    <tr><td><code>PUT</code></td><td><code>/v1/files/{path}</code></td><td>Atomic write. Creates parents, <code>?mode=0644</code></td></tr>
+    <tr><td><code>DELETE</code></td><td><code>/v1/files/{path}</code></td><td>Delete. A non-empty directory needs <code>?recursive=true</code> (409 otherwise)</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/health</code></td><td>Readiness: <code>200 {"status":"ok"}</code>, or 503 while shutting down</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/metadata</code></td><td>Env vars with the <code>SANDBOX_</code> prefix (credential-looking names withheld)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 id="sandboxd-internals">Internals</h3>
+
+<h4>Path confinement</h4>
+<p>Both file API paths and a process's <code>cwd</code> go through the same <code>SanitizePath</code>. It checks that the <em>real path after resolving symlinks</em> is still under the root, which blocks escapes via <code>../</code> or symlinks.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  IN["requested path&lt;br/&gt;e.g. src/../../etc/passwd"] --> J["join with root-dir and Clean"]
+  J --> EV["EvalSymlinks&lt;br/&gt;(resolve the nearest existing ancestor)"]
+  EV --> CK{"resolved path&lt;br/&gt;under root-dir?"}
+  CK -- "yes" --> OK["continue"]
+  CK -- "no" --> NG["REST: 403 PERMISSION_DENIED&lt;br/&gt;gRPC: PERMISSION_DENIED"]
+</pre>
+<figcaption>Figure 8: Symlink-aware confinement in SanitizePath.</figcaption>
+</figure>
+
+<h4>Atomic writes</h4>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as PUT handler
+  participant FS as /workspace
+  C->>H: PUT /v1/files/src/app.py (streamed body)
+  H->>FS: MkdirAll(src/)
+  H->>FS: CreateTemp(src/.sandboxd-tmp-*)
+  H->>FS: Chmod(mode) → io.Copy → Sync → Close
+  H->>FS: Rename(tmp → src/app.py)
+  H-->>C: 204 No Content
+  Note over H,FS: On failure or disconnect the temp file is removed.&lt;br/&gt;Readers only ever see the complete old or the complete new file
+</pre>
+<figcaption>Figure 9: Atomic write via temp file + rename.</figcaption>
+</figure>
+
+<h4>Running and cleaning up processes</h4>
+<p><code>Execute</code> <code>exec</code>s the command <strong>as an argv, with no shell in between</strong>, and puts it in its own process group with <code>Setpgid</code>. When the client's deadline passes or it cancels, the context ends and the whole process group, grandchildren included, is SIGKILLed (with a <code>/proc</code>-walking fallback for gVisor).</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant PS as ProcessServer
+  participant P as Child process (new PGID)
+  C->>PS: Execute(command, env, cwd) + deadline
+  Note over PS: SanitizePath the cwd, append env after os.Environ() so it wins
+  PS->>P: exec (Setpgid: true)
+  alt normal exit
+    P-->>PS: exit(code)
+    PS-->>C: stdout / stderr / exit_code (non-zero is not an error)
+  else context done (deadline or cancel)
+    PS->>P: kill(-PGID, SIGKILL)
+    PS-->>C: DEADLINE_EXCEEDED / CANCELLED
+  end
+</pre>
+<figcaption>Figure 10: Execute. A missing executable is NOT_FOUND (not a shell's exit code 127).</figcaption>
+</figure>
+
+<p>When the daemon itself receives SIGTERM, it sends SIGTERM to its managed processes, waits a grace period, SIGKILLs any stragglers, and then shuts down the HTTP and gRPC servers.</p>
+
+<h3 id="sandboxd-topology">Deployment topologies (where commands run)</h3>
+
+<p>The single most important fact: <strong>commands run in the root filesystem of the container hosting the sandboxd process</strong>. A shared volume shares <em>files</em>, not <em>binaries</em>.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph A["A: dedicated runtime container (default, used in this repo)"]
+    direction LR
+    A1["sandboxd image&lt;br/&gt;(debian-slim + sh + coreutils)"] --> A2["commands run&lt;br/&gt;inside this image"]
+  end
+  subgraph B["B: inject into an existing image"]
+    direction LR
+    B0["an initContainer copies&lt;br/&gt;the static binary&lt;br/&gt;into an emptyDir"] --> B1["your tool-rich image&lt;br/&gt;runs sandboxd as its command"] --> B2["commands run in your image&lt;br/&gt;(npm etc. just work)"]
+  end
+  subgraph X["Common pitfall: sidecar"]
+    direction LR
+    X2["workload container&lt;br/&gt;(python, npm ...)"] --- X3[("shared /workspace")] --- X1["sandboxd container"] --> X4["commands run in the sandboxd container&lt;br/&gt;and cannot see the workload's tools"]
+  end
+  A ~~~ B ~~~ X
+</pre>
+<figcaption>Figure 11: Deployment topologies. A isolates more strongly; B needs no image rebuild.</figcaption>
+</figure>
+
+<h3 id="sandboxd-security">Security model</h3>
+<ul>
+  <li><strong>No authentication, no TLS.</strong> With port-forward, the apiserver's RBAC (<code>pods/portforward</code>) authorizes access; over the pod network, protect it with NetworkPolicy or a service mesh.</li>
+  <li><strong>Listens on <code>0.0.0.0</code> by default.</strong> Containment comes from pod isolation and NetworkPolicy, not from loopback binding.</li>
+  <li><strong>Path confinement</strong> applies to every file path and <code>cwd</code>. Isolating a process's network or wider filesystem is the job of RuntimeClass, securityContext, and NetworkPolicy.</li>
+  <li><strong>metadata</strong> returns only prefix-allowed names and always withholds names containing <code>TOKEN</code> / <code>SECRET</code> / <code>PASSWORD</code> / <code>CREDENTIAL</code> / <code>KEY</code>.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="sdk"><span class="num">4.</span>The TypeScript SDK (agentic-sandbox-client)</h2>
+
+<p><code>clients/typescript/agentic-sandbox-client</code> brings the same concepts as the Go and Python clients to TypeScript (Node.js 22+, ESM). <code>@kubernetes/client-node</code> and <code>ws</code> are required dependencies; the gRPC packages <code>@bufbuild/protobuf</code> and <code>@connectrpc/connect(-node)</code> are <strong>optional peers imported lazily on the first <code>run()</code></strong>.</p>
+
+<pre class="code"><code>import { SandboxClient } from "agentic-sandbox-client";
+
+const client = new SandboxClient({ namespace: "default" });
+const sandbox = await client.createSandbox("sandboxd-warmpool"); <span class="c-cm">// ← K8s resource layer</span>
+try {
+  await sandbox.files.write("hello.txt", "hi\n");                  <span class="c-cm">// ← sandboxd layer (REST)</span>
+  const r = await sandbox.commands.run("cat", ["hello.txt"]);     <span class="c-cm">// ← sandboxd layer (gRPC)</span>
+  console.log(r.stdout, r.exitCode);
+} finally {
+  await sandbox.close();                                          <span class="c-cm">// close the connection and delete the claim</span>
+}</code></pre>
+
+<h3 id="sdk-layers">Two-layer architecture</h3>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph PUB["Public API"]
+    SC["SandboxClient&lt;br/&gt;createSandbox / getSandbox / deleteSandbox&lt;br/&gt;listAllSandboxes / deleteAll / enableAutoCleanup"]
+    SB["Sandbox&lt;br/&gt;claimName / sandboxName / podName / podIP / serviceFQDN&lt;br/&gt;close() / closeLocal() / health() / metadata()"]
+    F["sandbox.files&lt;br/&gt;read / write / readStream / writeStream&lt;br/&gt;exists / list / delete"]
+    CM["sandbox.commands&lt;br/&gt;run(command, args, opts)"]
+  end
+
+  subgraph K8S["K8s resource layer (sandbox-client.ts)"]
+    COA["CustomObjectsApi&lt;br/&gt;POST / GET / DELETE SandboxClaim"]
+    WT["k8s.Watch&lt;br/&gt;Claim → Sandbox Ready"]
+    REG["registry / attaching / provisioning&lt;br/&gt;(handle tracking, single-flight)"]
+  end
+
+  subgraph CONN["sandboxd communication layer (sandbox.ts and friends)"]
+    GEN["ConnectionGeneration&lt;br/&gt;lazy connect, generations"]
+    STR["ConnectionStrategy&lt;br/&gt;(connection.ts)"]
+    TUN["PodTunnel&lt;br/&gt;(tunnel.ts)"]
+    REST["SandboxdRestClient&lt;br/&gt;fetch (rest.ts)"]
+    PROC["ProcessClient&lt;br/&gt;Connect-ES gRPC (process.ts)"]
+  end
+
+  SC --> COA
+  SC --> WT
+  SC --> REG
+  SC -- "creates once Ready" --> SB
+  SB --> F
+  SB --> CM
+  F --> GEN
+  CM --> GEN
+  GEN --> STR
+  STR -- "port-forward" --> TUN
+  GEN --> REST
+  GEN --> PROC
+</pre>
+<figcaption>Figure 12: The SDK's two layers. The Sandbox handle is the seam between them.</figcaption>
+</figure>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>File</th><th>Layer</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>sandbox-client.ts</code></td><td>K8s</td><td>Creating claims, waiting for readiness (watch), deletion, handle registry, auto-cleanup</td></tr>
+    <tr><td><code>sandbox.ts</code></td><td>Seam</td><td>The Sandbox handle: lazy connection and generations, timeouts / aborts, close</td></tr>
+    <tr><td><code>files.ts</code> / <code>commands.ts</code></td><td>Public facades</td><td>Thin wrappers using only public types; the work is delegated to Sandbox's private implementation</td></tr>
+    <tr><td><code>connection.ts</code></td><td>Comms</td><td>Connectivity strategies (port-forward / in-cluster-service / in-cluster-pod-ip)</td></tr>
+    <tr><td><code>tunnel.ts</code></td><td>Comms</td><td>Bridges local TCP to the apiserver's WebSocket port-forward</td></tr>
+    <tr><td><code>rest.ts</code></td><td>Comms</td><td>REST client (path validation, size limits, streaming, error mapping)</td></tr>
+    <tr><td><code>process.ts</code></td><td>Comms</td><td>gRPC <code>Execute</code> client (lazy-loads optional deps, maps RPC errors)</td></tr>
+    <tr><td><code>exceptions.ts</code></td><td>Shared</td><td>Error hierarchy rooted at <code>SandboxError</code></td></tr>
+    <tr><td><code>trace-manager.ts</code></td><td>Shared</td><td>Optional OpenTelemetry. Never records paths or command strings</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-k8s">K8s resource layer</h3>
+
+<p><code>createSandbox(warmpool)</code> means "create a claim and wait until its assigned Sandbox is Ready". <strong>It does not connect to sandboxd yet.</strong></p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as App
+  participant SC as SandboxClient
+  participant API as kube-apiserver
+  App->>SC: createSandbox("sandboxd-warmpool", ns, opts)
+  Note over SC: validate args, claim name = sandbox-claim-{8 hex chars}
+  Note over SC: register in attaching and provisioning (single-flight)
+  SC->>API: POST SandboxClaim (warmPoolRef, optional lifecycle)
+  rect rgba(127,127,127,0.08)
+  Note over SC,API: Step 1: resolveSandboxName
+  loop until status.sandbox.name is set
+    SC->>API: GET SandboxClaim
+    SC->>API: WATCH SandboxClaim (from resourceVersion)
+    Note right of SC: fail fast on terminal Ready=False reasons&lt;br/&gt;(TemplateNotFound etc.)
+  end
+  end
+  rect rgba(127,127,127,0.08)
+  Note over SC,API: Step 2: watchForSandboxReady (remaining budget)
+  loop until Ready=True
+    SC->>API: GET Sandbox
+    SC->>API: WATCH Sandbox
+  end
+  end
+  Note over SC: read podName (pod-name annotation first), podIP, serviceFQDN
+  Note over SC: for in-cluster modes, check the address exists now
+  SC-->>App: new Sandbox(...) (not connected yet)
+  Note over SC,API: on any failure the claim is deleted as a rollback (not on 409: that claim isn't ours)
+</pre>
+<figcaption>Figure 13: createSandbox. sandboxReadyTimeout (seconds, default 180) covers steps 1 and 2 together.</figcaption>
+</figure>
+
+<h4>How the watch loop is built</h4>
+<p>It doesn't just watch: it GETs, then watches, and GETs again whenever the watch ends. <code>@kubernetes/client-node</code> 2.x aborts every watch after 30 seconds, so this is what lets it follow long waits reliably.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  G["GET (to get a resourceVersion)"] --> RD{"Already satisfied?"}
+  RD -- "yes" --> DONE(["done"])
+  RD -- "no" --> DL{"Deadline passed?"}
+  DL -- "yes" --> TO(["SandboxTimeoutError"])
+  DL -- "no" --> W["WATCH (one pass)"]
+  W -- "matching event" --> DONE
+  W -- "terminal error / 404" --> ERR(["fail immediately"])
+  W -- "clean close&lt;br/&gt;(normal close / 30s timeout / 410 Gone)" --> BO["back off&lt;br/&gt;100ms → up to 5s"]
+  BO --> G
+</pre>
+<figcaption>Figure 14: The GET + WATCH retry loop (same shape for Claim and Sandbox).</figcaption>
+</figure>
+
+<h4>Handle registry and cleanup</h4>
+<ul>
+  <li><strong>Single-flight:</strong> concurrent <code>getSandbox()</code> / <code>createSandbox()</code> calls for the same claim share one promise, so a claim never ends up with two handles.</li>
+  <li><strong><code>sandbox.close()</code></strong> waits up to 5 seconds for in-flight work, releases the connection, and <strong>deletes the SandboxClaim</strong> (404 counts as success). <code>closeLocal()</code> releases only the connection and leaves the claim.</li>
+  <li><strong><code>deleteAll()</code></strong> also sweeps claims still being created. If a delete races the create POST, the provisioning call notices right after the claim exists and rolls it back.</li>
+  <li><strong><code>enableAutoCleanup()</code></strong> runs <code>deleteAll()</code> on SIGINT / SIGTERM / <code>beforeExit</code>, then re-raises the signal.</li>
+  <li><strong><code>shutdownAfterSeconds</code></strong> sets an absolute <code>lifecycle.shutdownTime</code> and <code>shutdownPolicy: Delete</code> on the claim: a safety net so the controller cleans up even if the process dies.</li>
+</ul>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-conn">sandboxd communication layer</h3>
+
+<p>A Sandbox handle connects <strong>lazily</strong>, on the first <code>files.*</code> / <code>commands.run()</code> / <code>health()</code> / <code>metadata()</code> call. The whole connection (transport + REST client + gRPC client) is treated as one <strong>ConnectionGeneration</strong>, and REST and gRPC always come from the same generation.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  direction LR
+  [*] --> Disconnected
+  Disconnected --> Connecting: first call / next call
+  Connecting --> Connected: transport open + /v1/health 200
+  Connecting --> Disconnected: failure or portForwardReadyTimeoutMs
+  Connected --> Invalidated: SandboxConnectionError observed
+  Invalidated --> Disconnected: generation discarded (in-flight calls on it fail too)
+  Connected --> Closed: close() / closeLocal()
+  Connecting --> Closed: close() / closeLocal()
+  Disconnected --> Closed: close() / closeLocal()
+  Closed --> [*]
+</pre>
+<figcaption>Figure 15: Connection generations. Nothing is retried automatically; the next call reconnects with a fresh generation.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Op as Operation (files / run)
+  participant SB as Sandbox
+  participant ST as ConnectionStrategy
+  participant R as SandboxdRestClient
+  participant P as ProcessClient
+  Op->>SB: runOperation(timeoutMs, signal)
+  Note over SB: ensureConnected() (concurrent callers share one connect)
+  alt no current generation
+    SB->>ST: open()
+    ST-->>SB: transport (restBaseUrl / grpcBaseUrl)
+    loop every 200ms (retry only on 503 / connection errors)
+      SB->>R: GET /v1/health
+    end
+    Note right of SB: a 401/403/404 port-forward rejection is terminal
+    SB->>P: new ProcessClient(grpcBaseUrl)
+    Note over SB: make the new generation current
+  end
+  Note over SB: in-flight count++
+  SB->>R: REST call (files / health / metadata)
+  SB->>P: or gRPC Execute (remaining budget as deadline)
+  Note over SB: in-flight count-- (used by close() to drain)
+</pre>
+<figcaption>Figure 16: Lazy connect and health check. The gRPC packages are imported the first time ProcessClient is used.</figcaption>
+</figure>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-connectivity">Connectivity modes</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Value</th><th>Path</th><th>Requirements</th><th>Good for</th></tr></thead>
+  <tbody>
+    <tr><td><code>"port-forward"</code> (default)</td><td>WebSocket port-forward through the apiserver</td><td>A kubeconfig with <code>pods/portforward</code></td><td>Laptops, CI, anything outside the cluster</td></tr>
+    <tr><td><code>"in-cluster-service"</code></td><td>Straight to the headless Service DNS name (<code>status.serviceFQDN</code>)</td><td>Runs in-cluster + <code>service: true</code> on the template + allowed by NetworkPolicy</td><td>In-cluster workers; recommended across trust boundaries</td></tr>
+    <tr><td><code>"in-cluster-pod-ip"</code></td><td>Straight to the pod IP (<code>status.podIPs</code>, IPv4 first)</td><td>Runs in-cluster + allowed by NetworkPolicy</td><td>When a Service isn't possible. Risk of a reused IP</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph PF["port-forward (default)"]
+    direction LR
+    A1["SDK"] -- "HTTP / HTTP2" --> L1["127.0.0.1:random&lt;br/&gt;one for REST, one for gRPC"]
+    L1 -- "WebSocket&lt;br/&gt;(one per TCP connection)" --> K1["kube-apiserver&lt;br/&gt;/pods/NAME/portforward"]
+    K1 --> KL["kubelet"] --> D1["sandboxd&lt;br/&gt;:8080 / :9090"]
+  end
+  subgraph SVC["in-cluster-service"]
+    direction LR
+    A2["SDK (pod in the cluster)"] -- "plaintext HTTP / h2c" --> S2["NAME.ns.svc.cluster.local&lt;br/&gt;(headless Service)"] --> D2["sandboxd"]
+  end
+  subgraph IP["in-cluster-pod-ip"]
+    direction LR
+    A3["SDK (pod in the cluster)"] -- "plaintext HTTP / h2c" --> D3["Pod IP:8080 / :9090"]
+  end
+  PF ~~~ SVC ~~~ IP
+</pre>
+<figcaption>Figure 17: The three connectivity modes. The in-cluster modes never fall back; each uses exactly one address.</figcaption>
+</figure>
+
+<h4>How PodTunnel works (port-forward)</h4>
+<p><code>PodTunnel</code> opens two TCP listeners on random <code>127.0.0.1</code> ports, one for REST and one for gRPC, and <strong>opens one WebSocket to the apiserver for every TCP connection it accepts</strong>. To <code>fetch</code> and Connect-ES above it, this looks like an ordinary local server, so HTTP/2 (gRPC) passes straight through.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant H as fetch / HTTP2 client
+  participant L as local TCP listener
+  participant T as PodTunnel
+  participant K as kube-apiserver
+  participant D as sandboxd
+  H->>L: TCP connect
+  L->>T: accept (socket paused)
+  T->>K: WebSocket upgrade&lt;br/&gt;/api/v1/namespaces/NS/pods/POD/portforward?ports=8080
+  K-->>T: 101 Switching Protocols (channel 0 = data, 1 = error)
+  Note over T: strip the 2-byte port header at the start of each channel
+  T->>L: resume the socket and start pumping
+  loop both directions (1 MiB backpressure)
+    H->>T: bytes
+    T->>K: channel 0 frames
+    K->>D: TCP
+    D-->>K: response
+    K-->>T: channel 0 frames
+    T-->>H: bytes
+  end
+  Note over T,K: any payload on the error channel (up to 4 KiB kept) tears the pair down
+</pre>
+<figcaption>Figure 18: PodTunnel relaying TCP ⇔ WebSocket.</figcaption>
+</figure>
+
+<div class="callout warn">
+  <p><strong>Trust boundary:</strong> the local listeners have no authentication of their own. While the connection is open, any other process in the same network namespace can drive the sandbox through those ports. In the in-cluster modes, REST and gRPC cross the pod network in plaintext, so protect them with a NetworkPolicy or a service mesh.</p>
+</div>
+
+<!-- ------------------------------ -->
+<h3 id="sdk-ops">Operations and errors</h3>
+
+<h4>What happens on each call</h4>
+<p>Every runtime call goes through <code>runOperation()</code>. <code>timeoutMs</code> (default 60s) is a <strong>total budget that includes waiting on the connect</strong>. The timeout, handle close, the caller's <code>AbortSignal</code>, and generation invalidation are merged into one signal with <code>AbortSignal.any()</code>.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  IN(["files.write(), commands.run(), ..."]) --> V["validate input client-side&lt;br/&gt;(paths: reject absolute and ..; argv / env / cwd types)"]
+  V --> SIG["signal = any(timeout, lifecycle, caller signal)"]
+  SIG --> EC["ensureConnected()"]
+  EC --> CALL["call REST or gRPC&lt;br/&gt;with the generation's abort merged in"]
+  CALL -- "success" --> OK(["return the result"])
+  CALL -- "failure" --> CL{"classify the cause"}
+  CL -- "timeout" --> E1["SandboxTimeoutError"]
+  CL -- "handle closed" --> E2["SandboxClosedError"]
+  CL -- "caller aborted" --> E3["signal.reason"]
+  CL -- "SandboxConnectionError" --> E4["invalidate the generation and rethrow&lt;br/&gt;(the next call reconnects)"]
+  CL -- "API / RPC error" --> E5["SandboxdApiError / SandboxdRpcError"]
+</pre>
+<figcaption>Figure 19: runOperation and error classification. The SDK never retries a failed call on its own.</figcaption>
+</figure>
+
+<h4>files vs. commands</h4>
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th><code>sandbox.files.*</code></th><th><code>sandbox.commands.run()</code></th></tr></thead>
+  <tbody>
+    <tr><td>Protocol</td><td>REST (Node's built-in <code>fetch</code>)</td><td>gRPC <code>Execute</code> (Connect-ES, HTTP/2)</td></tr>
+    <tr><td>Extra deps</td><td>None</td><td><code>@bufbuild/protobuf</code>, <code>@connectrpc/connect</code>, <code>@connectrpc/connect-node</code></td></tr>
+    <tr><td>Size limits</td><td><code>maxDownloadSize</code> / <code>maxUploadSize</code> (256 MiB each, enforced incrementally while streaming)</td><td><code>maxCommandOutputSize</code> (4 MiB for stdout + stderr + protobuf overhead)</td></tr>
+    <tr><td>Input</td><td>Root-relative POSIX paths. Absolute paths and <code>..</code> are rejected before any request</td><td>An argv as-is, never wrapped in a shell (use <code>run("sh", ["-c", "..."])</code> when needed)</td></tr>
+    <tr><td>Result</td><td><code>Uint8Array</code> / <code>ReadableStream</code> / <code>DirectoryListing</code>, etc.</td><td><code>{ stdout, stderr, exitCode }</code>. A non-zero exitCode is not an error</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Error hierarchy</h4>
+<figure class="diagram">
+<pre class="mermaid">
+classDiagram
+  direction LR
+  class SandboxError
+  class SandboxNotFoundError
+  class SandboxMetadataError
+  class SandboxNoServiceError
+  class SandboxTimeoutError
+  class SandboxTemplateNotFoundError
+  class SandboxWarmPoolNotFoundError
+  class SandboxClaimFailedError
+  class SandboxClosedError
+  class SandboxConnectionError {
+    kind: SandboxConnectionErrorKind
+  }
+  class SandboxdApiError {
+    status: number
+    code: SandboxdApiCode
+  }
+  class SandboxdRpcError {
+    code: string
+  }
+  SandboxError &lt;|-- SandboxNotFoundError
+  SandboxError &lt;|-- SandboxMetadataError
+  SandboxError &lt;|-- SandboxNoServiceError
+  SandboxError &lt;|-- SandboxTimeoutError
+  SandboxError &lt;|-- SandboxTemplateNotFoundError
+  SandboxError &lt;|-- SandboxWarmPoolNotFoundError
+  SandboxError &lt;|-- SandboxClaimFailedError
+  SandboxError &lt;|-- SandboxClosedError
+  SandboxError &lt;|-- SandboxConnectionError
+  SandboxError &lt;|-- SandboxdApiError
+  SandboxError &lt;|-- SandboxdRpcError
+</pre>
+<figcaption>Figure 20: Error hierarchy. SandboxConnectionError / SandboxdApiError / SandboxdRpcError come from the sandboxd layer; the rest mostly come from the K8s resource layer or the handle's state.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="e2e"><span class="num">5.</span>End to end</h2>
+
+<p>Putting it all together, <code>createSandbox → files.write → commands.run → close</code> looks like this (with port-forward):</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as App
+  participant SDK as SDK
+  participant API as kube-apiserver
+  participant CTL as controller
+  participant D as sandboxd (Pod)
+
+  App->>SDK: createSandbox("sandboxd-warmpool")
+  SDK->>API: POST SandboxClaim
+  API-->>CTL: claim added
+  CTL->>API: adopt a pool Sandbox / update status
+  SDK->>API: GET + WATCH (Claim → Sandbox Ready)
+  SDK-->>App: Sandbox handle (not connected)
+
+  App->>SDK: files.write("a.txt", "hi")
+  Note over SDK: start PodTunnel (two 127.0.0.1 listeners)
+  SDK->>API: WebSocket portforward
+  API->>D: GET /v1/health
+  D-->>SDK: 200 ok
+  SDK->>D: PUT /v1/files/a.txt
+  D-->>SDK: 204
+
+  App->>SDK: commands.run("cat", ["a.txt"])
+  Note over SDK: lazily import gRPC deps, open an HTTP/2 session
+  SDK->>D: ProcessService.Execute (same generation, same tunnel)
+  D-->>SDK: stdout "hi" / exitCode 0
+  SDK-->>App: ExecutionResult
+
+  App->>SDK: close()
+  Note over SDK: drain in-flight work, close the tunnel
+  SDK->>API: DELETE SandboxClaim
+  API-->>CTL: claim deleted → Sandbox / Pod cascade-deleted
+</pre>
+<figcaption>Figure 21: The whole flow. Control plane and data plane take turns.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="demos"><span class="num">6.</span>Demos in this repository</h2>
+
+<p><a href="https://github.com/khirotaka/try-agent-sandbox-ts">try-agent-sandbox-ts</a> exercises both connectivity styles against the same SandboxTemplate / WarmPool.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph HOST["Local machine"]
+    PG["playground/&lt;br/&gt;task playground:run&lt;br/&gt;(port-forward)"]
+  end
+  subgraph KIND["kind cluster"]
+    API[("kube-apiserver")]
+    subgraph NS["namespace: default"]
+      JOB["sandbox-job Pod&lt;br/&gt;label app=sandbox-job&lt;br/&gt;(in-cluster-service)"]
+      NP{{"NetworkPolicy&lt;br/&gt;ingress: app=sandbox-job&lt;br/&gt;TCP 8080 / 9090 only"}}
+      subgraph SBX["Sandbox Pod (sandboxd-template)"]
+        D["sandboxd&lt;br/&gt;runAsNonRoot / drop ALL"]
+      end
+      SVC["headless Service&lt;br/&gt;(service: true)"]
+    end
+  end
+  PG -- "kubeconfig" --> API
+  API -- "port-forward&lt;br/&gt;(not subject to NetworkPolicy)" --> D
+  JOB -- "create claim (RBAC: Role)" --> API
+  JOB -- "DNS" --> SVC
+  SVC --> NP --> D
+</pre>
+<figcaption>Figure 22: The playground (outside the cluster) and sandbox-job (inside) take different paths.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>playground</strong> (<code>playground/index.ts</code>): needs only a kubeconfig. It exercises health / metadata, argv execution, env / cwd, non-zero exits, a missing executable, every files operation, path confinement, and SandboxClient's list / delete APIs.</li>
+  <li><strong>sandbox-job</strong> (<code>sandbox-job/</code>): a Kubernetes Job that creates a claim and talks to sandboxd directly through the headless Service. The key detail is the template's <code>networkPolicy</code>, which admits 8080/9090 only from <code>app: sandbox-job</code>. The default policy admits only the sandbox-router, and the router cannot proxy gRPC.</li>
+</ul>
+
+<pre class="code"><code>task cluster:create    <span class="c-cm"># kind + controller v1.0.4 + sandboxd image + Template/WarmPool</span>
+task playground:run    <span class="c-cm"># from outside the cluster via port-forward</span>
+task job:run           <span class="c-cm"># from inside the cluster via in-cluster-service</span>
+task cluster:delete</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="references"><span class="num">7.</span>References</h2>
+<ul>
+  <li><a href="https://github.com/kubernetes-sigs/agent-sandbox">kubernetes-sigs/agent-sandbox</a> (upstream) / <a href="https://agent-sandbox.sigs.k8s.io">agent-sandbox.sigs.k8s.io</a></li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox">khirotaka/agent-sandbox</a> (the fork with the TypeScript SDK)</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/clients/typescript/agentic-sandbox-client">clients/typescript/agentic-sandbox-client</a>: SDK source and README</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/blob/7d97d6e52832f95d1fb7e87078f324ae486d180b/packages/sandboxd/USER_GUIDE.md">packages/sandboxd/USER_GUIDE.md</a>: sandboxd user guide</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/packages/sandboxd/spec">packages/sandboxd/spec</a>: <code>process.proto</code> and <code>filesystem.yaml</code> (OpenAPI)</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/api/v1beta1">api/v1beta1</a> / <a href="https://github.com/khirotaka/agent-sandbox/tree/7d97d6e52832f95d1fb7e87078f324ae486d180b/extensions/api/v1beta1">extensions/api/v1beta1</a>: CRD type definitions</li>
+</ul>
+
+<footer class="site-footer">
+  <p>An unofficial guide, based on khirotaka/agent-sandbox commit <code>7d97d6e</code> and agent-sandbox controller v1.0.4. Spotted a mistake? Please open an <a href="https://github.com/khirotaka/try-agent-sandbox-ts/issues">issue</a>.</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
