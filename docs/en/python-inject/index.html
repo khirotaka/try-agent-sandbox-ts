@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Injecting sandboxd into Python</title>
+<meta name="description" content="How the sample injects the sandboxd binary into an unmodified python:3.14-slim image with an initContainer, then runs python and pip install from the TypeScript SDK.">
+<link rel="alternate" hreflang="ja" href="../../python-inject/">
+<link rel="alternate" hreflang="en" href="./">
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+  try {
+    var t = localStorage.getItem("as-doc-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<script type="module" src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <button class="toc-toggle" type="button" aria-label="Contents">☰</button>
+  <a class="site-title" href="../">Agent Sandbox Explained (unofficial)</a>
+  <span class="header-spacer"></span>
+  <nav class="lang-tabs" aria-label="Language">
+    <a href="../../python-inject/" data-lang="ja">日本語</a>
+    <a href="./" data-lang="en" aria-current="page">English</a>
+  </nav>
+  <button class="theme-toggle" type="button" aria-label="Toggle theme">☾</button>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <p class="toc-title">Contents</p>
+  <ol>
+    <li><a href="#overview">0. Introduction</a></li>
+    <li><a href="#why">1. Why inject?</a></li>
+    <li><a href="#how">2. How injection works</a></li>
+    <li><a href="#manifest">3. The manifest</a>
+      <ol>
+        <li><a href="#manifest-init">initContainer</a></li>
+        <li><a href="#manifest-app">python container</a></li>
+        <li><a href="#manifest-home">Overriding HOME</a></li>
+        <li><a href="#manifest-dns">NetworkPolicy and DNS</a></li>
+        <li><a href="#manifest-diff">Diff from upstream</a></li>
+      </ol>
+    </li>
+    <li><a href="#client">4. The client (python-sandbox)</a></li>
+    <li><a href="#run">5. Running it</a></li>
+    <li><a href="#caveats">6. Caveats and trade-offs</a></li>
+    <li><a href="#references">7. References</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<p><a href="../">← Back to Agent Sandbox Explained (main guide)</a></p>
+
+<section class="hero" id="overview">
+  <h1>Injecting sandboxd into a Python image to use pip</h1>
+  <p class="lede">In sandboxd's default layout, commands run inside the sandboxd image (a shell and coreutils only), so there is no <code>python</code> and no <code>pip</code>. This sample injects the sandboxd binary into the official <code>python:3.14-slim</code> image <strong>without rebuilding it</strong>, then runs a Python script and <code>pip install numpy</code> from the TypeScript SDK.</p>
+  <div class="badges">
+    <span class="badge">topology B (binary injection)</span>
+    <span class="badge">python:3.14-slim</span>
+    <span class="badge">sandboxd-inject-warmpool</span>
+  </div>
+</section>
+
+<p>This page covers three files:</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>File</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>manifests/sandbox-template-and-pool-inject.yaml</code></td><td>The SandboxTemplate <code>sandboxd-inject-template</code> and SandboxWarmPool <code>sandboxd-inject-warmpool</code> that inject sandboxd</td></tr>
+    <tr><td><code>python-sandbox/main.ts</code></td><td>A client that claims a sandbox from that pool and runs <code>python</code> / <code>pip</code></td></tr>
+    <tr><td><code>Taskfile.yaml</code></td><td><code>cluster:install-sandbox-template-and-pool</code> also applies the injection manifest; a new <code>python-sandbox:run</code> task</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>It is based on agent-sandbox's <code>examples/sandboxd-sandbox/deploy/b-inject-binary.yaml</code>, which injects into a Node.js image.</p>
+
+<!-- ============================================================ -->
+<h2 id="why"><span class="num">1.</span>Why inject?</h2>
+
+<p>As the main guide's <a href="../#sandboxd-topology">deployment topologies</a> section explains, <strong>commands run in the root filesystem of the container where the sandboxd process lives</strong>. sandboxd's gRPC <code>Execute</code> simply <code>exec</code>s inside its own container.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph A["A: default (manifests/sandbox-template-and-pool.yaml)"]
+    direction LR
+    A1["sandboxd image&lt;br/&gt;debian-slim + sh + coreutils"] --> A2["run('python', ...)&lt;br/&gt;→ NOT_FOUND"]
+  end
+  subgraph X["Does not work: sidecar"]
+    direction LR
+    X1["python container"] --- X3[("shared /workspace")] --- X2["sandboxd container"] --> X4["run('python', ...)&lt;br/&gt;→ looked up in sandboxd's image: NOT_FOUND"]
+  end
+  subgraph B["B: injection (this sample)"]
+    direction LR
+    B1["python:3.14-slim launches&lt;br/&gt;sandboxd as its command"] --> B2["run('python', ...)&lt;br/&gt;→ finds /usr/local/bin/python"]
+  end
+  A ~~~ X ~~~ B
+</pre>
+<figcaption>Figure 1: Where sandboxd runs decides which tools commands can see.</figcaption>
+</figure>
+
+<p>There are two ways out:</p>
+<ul>
+  <li><strong>A': build your own runtime image</strong> — bake sandboxd and Python into one image. Stronger isolation, but you must build and distribute an image.</li>
+  <li><strong>B: inject the binary into an existing image</strong> — sandboxd is a single statically linked binary, so an initContainer can copy it into a shared volume and the existing image just needs its <code>command</code> overridden. <strong>This sample uses B.</strong></li>
+</ul>
+
+<div class="callout">
+  <p><strong>Key point:</strong> a shared volume carries <em>files</em>, not an <em>execution environment</em>. To use <code>python</code>, sandboxd itself must run inside an image that has <code>python</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="how"><span class="num">2.</span>How injection works</h2>
+
+<p>The pod starts in two stages. First an initContainer pulls the binary out of the sandboxd image into an <code>emptyDir</code>; then the python container launches that binary as PID 1.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph POD["Sandbox Pod (sandboxd-inject-template)"]
+    direction LR
+    subgraph INIT["initContainer: install-sandboxd&lt;br/&gt;image: kind.local/sandboxd:latest"]
+      CP["cp /usr/local/bin/sandboxd&lt;br/&gt;/sandboxd-bin/sandboxd"]
+    end
+    BIN[("emptyDir&lt;br/&gt;sandboxd-bin")]
+    subgraph APP["container: python&lt;br/&gt;image: python:3.14-slim (unmodified)"]
+      D["PID 1: /sandboxd-bin/sandboxd&lt;br/&gt;REST :8080 / gRPC :9090"]
+      PY["child processes&lt;br/&gt;python / pip / sh"]
+    end
+    WS[("emptyDir&lt;br/&gt;workspace → /workspace")]
+  end
+  CP -- "writes" --> BIN
+  BIN -- "mounted readOnly" --> D
+  D -- "exec (same rootfs)" --> PY
+  D --- WS
+  PY -- "cwd / HOME" --> WS
+</pre>
+<figcaption>Figure 2: Pod layout. The python image is untouched; only its command is replaced.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant K as kubelet
+  participant I as install-sandboxd (init)
+  participant P as python container
+  participant D as sandboxd (PID 1)
+  K->>I: start (sandboxd image)
+  I->>I: cp sandboxd → /sandboxd-bin/
+  I-->>K: exits successfully
+  K->>P: start (python:3.14-slim, command overridden)
+  P->>D: /sandboxd-bin/sandboxd --root-dir=/workspace ...
+  loop readinessProbe (every 1s)
+    K->>D: GET /v1/health
+  end
+  D-->>K: 200 ok → Pod Ready → Sandbox Ready
+</pre>
+<figcaption>Figure 3: Startup sequence. The Ready sandbox then waits in the WarmPool.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="manifest"><span class="num">3.</span>The manifest</h2>
+
+<p>Below are the parts of <code>manifests/sandbox-template-and-pool-inject.yaml</code> that matter for injection.</p>
+
+<h3 id="manifest-init">initContainer: copying the binary</h3>
+
+<pre class="code"><code>initContainers:
+  - name: install-sandboxd
+    image: kind.local/sandboxd:latest   <span class="c-cm"># built by task docker:build-sandboxd</span>
+    command: ["/bin/sh", "-c", "cp /usr/local/bin/sandboxd /sandboxd-bin/sandboxd"]
+    securityContext:
+      runAsUser: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }
+    volumeMounts:
+      - name: sandboxd-bin
+        mountPath: /sandboxd-bin</code></pre>
+
+<ul>
+  <li>This is the <strong>only</strong> place the sandboxd image is referenced. Upstream uses the staging registry image; this repo uses <code>kind.local/sandboxd:latest</code> built from the submodule, so the daemon always matches the TypeScript SDK.</li>
+  <li>The pod-level <code>securityContext.fsGroup: 1000</code> lets the non-root user (uid 1000) write to the <code>emptyDir</code>.</li>
+</ul>
+
+<h3 id="manifest-app">python container: overriding the command</h3>
+
+<pre class="code"><code>containers:
+  - name: python
+    image: python:3.14-slim             <span class="c-cm"># the official image, unmodified</span>
+    command:
+      - /sandboxd-bin/sandboxd          <span class="c-cm"># launch the injected binary</span>
+      - --root-dir=/workspace
+      - --rest-port=8080
+      - --grpc-port=9090
+    readinessProbe:
+      httpGet: { path: /v1/health, port: 8080 }
+      periodSeconds: 1
+    volumeMounts:
+      - name: sandboxd-bin
+        mountPath: /sandboxd-bin
+        readOnly: true                  <span class="c-cm"># sandboxed commands must not replace it</span>
+      - name: workspace
+        mountPath: /workspace</code></pre>
+
+<ul>
+  <li>Overriding <code>command</code> means the image's own <code>ENTRYPOINT</code>/<code>CMD</code> (the python REPL) never starts; sandboxd runs instead. Image environment variables such as <code>PATH</code> are kept and passed on to every child process sandboxd starts.</li>
+  <li>Mounting <code>sandboxd-bin</code> with <strong><code>readOnly: true</code></strong> matters. If it were writable, untrusted code in the sandbox could replace the binary, and the replacement would run as PID 1 on the next container restart.</li>
+  <li>The readinessProbe's <code>periodSeconds: 1</code> just gets pool sandboxes to Ready a little sooner.</li>
+</ul>
+
+<h3 id="manifest-home">Pointing HOME at /workspace</h3>
+
+<pre class="code"><code>env:
+  - name: SANDBOX_EXAMPLE             <span class="c-cm"># visible via sandbox.metadata()</span>
+    value: try-agent-sandbox-ts
+  - name: HOME
+    value: /workspace</code></pre>
+
+<p><code>python:3.14-slim</code> assumes it runs as root, and its <code>HOME</code> is <code>/root</code>. Running as <code>runAsUser: 1000</code>, <code>/root</code> is unreadable, which breaks pip's cache and user installs.</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  PIP["pip install numpy (uid 1000)"] --> SP{"Can write to&lt;br/&gt;/usr/local/lib/python3.14/site-packages?"}
+  SP -- "No (owned by root)" --> USER["Falls back to a user install&lt;br/&gt;(Defaulting to user installation)"]
+  USER --> H{"HOME?"}
+  H -- "/root (default)" --> NG["Cannot write: fails"]
+  H -- "/workspace (overridden)" --> OK["Installs into&lt;br/&gt;/workspace/.local/lib/python3.14/site-packages"]
+  OK --> IMP["python can import numpy&lt;br/&gt;(user site is resolved from HOME)"]
+</pre>
+<figcaption>Figure 4: pip as a non-root user. Without the HOME override the install fails.</figcaption>
+</figure>
+
+<p>Because packages land in <code>/workspace</code> (an <code>emptyDir</code>), they disappear with the sandbox. You can inspect them from the SDK with <code>sandbox.files.list(".local")</code>.</p>
+
+<h3 id="manifest-dns">NetworkPolicy and DNS</h3>
+
+<p><code>pip install</code> needs to reach PyPI, which means <strong>egress and name resolution</strong>. There is a trap here.</p>
+
+<ul>
+  <li>Supplying <code>networkPolicy</code> on the template <strong>replaces</strong> the controller's secure defaults entirely, so the default egress rule (public internet only; RFC1918 and link-local blocked) is restated explicitly.</li>
+  <li>The controller swaps the pod's DNS to public resolvers only when <code>networkPolicy</code> is <em>omitted</em>. With a custom policy the pod keeps the default <code>ClusterFirst</code>, so DNS goes to kube-dns (<code>10.96.0.10</code>), which the egress <code>except: 10.0.0.0/8</code> blocks. <strong>Name resolution stalls and <code>pip install</code> hangs.</strong></li>
+  <li>So the template sets <code>dnsPolicy: None</code> with <code>dnsConfig.nameservers</code> (<code>8.8.8.8</code> / <code>1.1.1.1</code>), restating the controller's default.</li>
+</ul>
+
+<pre class="code"><code>podTemplate:
+  spec:
+    dnsPolicy: None
+    dnsConfig:
+      nameservers:
+        - 8.8.8.8
+        - 1.1.1.1</code></pre>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  PIP["pip (inside the Sandbox Pod)"] -- "① DNS: pypi.org" --> R{"resolver"}
+  R -- "ClusterFirst&lt;br/&gt;→ kube-dns 10.96.0.10" --> BLK["blocked by egress&lt;br/&gt;except 10.0.0.0/8 → hangs"]
+  R -- "dnsPolicy: None&lt;br/&gt;→ 8.8.8.8 / 1.1.1.1" --> PUB["public resolvers (allowed)"]
+  PUB --> PIP2["② HTTPS: pypi.org / files.pythonhosted.org&lt;br/&gt;(allowed as 0.0.0.0/0)"]
+</pre>
+<figcaption>Figure 5: How a custom networkPolicy interacts with DNS.</figcaption>
+</figure>
+
+<p>On the ingress side, as in the default layout, 8080/9090 are admitted from <code>app: sandbox-job</code>. The <code>python-sandbox</code> client connects over port-forward, so this rule does not affect it (port-forward enters the pod's network namespace directly and is not subject to NetworkPolicy).</p>
+
+<h3 id="manifest-diff">Diff from upstream (b-inject-binary.yaml)</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Item</th><th>upstream <code>b-inject-binary.yaml</code></th><th>This repository</th></tr></thead>
+  <tbody>
+    <tr><td>App image</td><td><code>node:22-slim</code></td><td><code>python:3.14-slim</code></td></tr>
+    <tr><td>sandboxd image</td><td>staging registry <code>sandboxd:latest-main</code></td><td><code>kind.local/sandboxd:latest</code> built from the submodule</td></tr>
+    <tr><td>WarmPool name</td><td><code>sandboxd-warmpool</code></td><td><code>sandboxd-inject-warmpool</code> (to coexist with the default pool)</td></tr>
+    <tr><td><code>service</code> / <code>networkPolicy</code></td><td>none (controller defaults)</td><td><code>service: true</code> + ingress for sandbox-job + default-equivalent egress</td></tr>
+    <tr><td>DNS</td><td>unset</td><td><code>dnsPolicy: None</code> + public resolvers</td></tr>
+    <tr><td>Environment</td><td>none</td><td><code>HOME=/workspace</code>, <code>SANDBOX_EXAMPLE</code></td></tr>
+    <tr><td>readinessProbe</td><td>default period</td><td><code>periodSeconds: 1</code></td></tr>
+    <tr><td>WarmPool <code>updateStrategy</code></td><td><code>Recreate</code></td><td>unset (default <code>OnReplenish</code>)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="client"><span class="num">4.</span>The client (python-sandbox)</h2>
+
+<p><code>python-sandbox/main.ts</code> uses only the SDK API described in the main guide. The only difference is the pool it claims from.</p>
+
+<pre class="code"><code>import { SandboxClient } from "agentic-sandbox-client";
+
+const client = new SandboxClient({ namespace: "default", quiet: true });
+const sandbox = await client.createSandbox("sandboxd-inject-warmpool"); <span class="c-cm">// ← the injection pool</span>
+
+try {
+  <span class="c-cm">// 1. confirm python ships in the image</span>
+  const result = await sandbox.commands.run("python", ["--version"]);
+  console.log(result.stdout);
+
+  <span class="c-cm">// 2. write a script over REST, run it over gRPC</span>
+  await sandbox.files.write("./hello.py", `...print("Hello, from sandbox")...`);
+  const helloResult = await sandbox.commands.run("python", ["./hello.py"]);
+  console.log(helloResult.stdout);
+
+  <span class="c-cm">// 3. add a package with pip (through a shell)</span>
+  const numpyInstall = await sandbox.commands.run("sh", ["-c", "pip install numpy"]);
+  console.log(`exit code: ${numpyInstall.exitCode}`);
+
+  <span class="c-cm">// 4. run a script that uses the new package</span>
+  await sandbox.files.write("./call_numpy.py", `...np.arange(0, 10, 1)...`);
+  const callNumpyResult = await sandbox.commands.run("python", ["./call_numpy.py"]);
+  console.log(callNumpyResult.stdout);
+} finally {
+  await sandbox.close();  <span class="c-cm">// deletes the claim → sandbox / pod go too</span>
+}</code></pre>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as main.ts
+  participant SDK as SDK
+  participant D as sandboxd (in python container)
+  participant PyPI as PyPI
+  App->>SDK: createSandbox("sandboxd-inject-warmpool")
+  Note over SDK: create claim → adopt a Ready pool sandbox
+  App->>SDK: commands.run("python", ["--version"])
+  SDK->>D: gRPC Execute (via port-forward)
+  D-->>SDK: stdout "Python 3.14.x"
+  App->>SDK: files.write("./hello.py")
+  SDK->>D: PUT /v1/files/hello.py → /workspace/hello.py
+  App->>SDK: commands.run("python", ["./hello.py"])
+  D-->>SDK: stdout "Hello, from sandbox"
+  App->>SDK: commands.run("sh", ["-c", "pip install numpy"])
+  D->>PyPI: DNS (public resolvers) + HTTPS
+  PyPI-->>D: numpy wheel
+  Note over D: user install into /workspace/.local
+  D-->>SDK: exitCode 0
+  App->>SDK: files.write + commands.run("python", ["./call_numpy.py"])
+  D-->>SDK: stdout "[0 1 2 3 4 5 6 7 8 9]"
+  App->>SDK: close()
+</pre>
+<figcaption>Figure 6: What main.ts does. Every command runs inside python:3.14-slim's rootfs.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Files and commands see the same <code>/workspace</code>.</strong> A file written with <code>files.write("./hello.py")</code> is readable as <code>./hello.py</code> by processes whose cwd defaults to <code>--root-dir</code> (<code>/workspace</code>).</li>
+  <li><strong><code>run()</code> does not use a shell.</strong> argv is exec'd as-is, so <code>run("python", ["./hello.py"])</code> just works. Wrapping <code>pip install numpy</code> in <code>sh -c</code> leaves room for shell features (pipes, redirects); <code>run("pip", ["install", "numpy"])</code> gives the same result.</li>
+  <li><strong>A non-zero exit is not an error.</strong> Check <code>exitCode</code> to see whether <code>pip install</code> succeeded; the reason for a failure is in <code>stderr</code>.</li>
+  <li><strong>Timeouts:</strong> <code>run()</code> defaults to <code>timeoutMs</code> of 60 seconds. On slow links or for large packages, raise it, e.g. <code>{ timeoutMs: 300_000 }</code>. On expiry the whole process group is SIGKILLed.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="run"><span class="num">5.</span>Running it</h2>
+
+<pre class="code"><code>task cluster:create        <span class="c-cm"># kind + controller + sandboxd image + default and injection Template/WarmPool</span>
+task python-sandbox:run    <span class="c-cm"># runs python-sandbox/main.ts (port-forward)</span>
+task cluster:delete</code></pre>
+
+<p>To add only the injection pool to an existing cluster:</p>
+
+<pre class="code"><code>task docker:build-sandboxd
+kubectl apply -f manifests/sandbox-template-and-pool-inject.yaml
+kubectl get sandboxwarmpool sandboxd-inject-warmpool</code></pre>
+
+<p>Expected output (versions and pip logs vary by environment):</p>
+
+<pre class="code"><code>Python 3.14.x
+
+Hello, from sandbox
+
+exit code: 0
+[0 1 2 3 4 5 6 7 8 9]</code></pre>
+
+<div class="callout">
+  <p><strong>Using it from other clients:</strong> <code>playground/</code> and <code>sandbox-job/</code> use the default <code>sandboxd-warmpool</code>. <code>sandbox-job</code> reads the pool name from the <code>WARMPOOL</code> environment variable, so setting it to <code>sandboxd-inject-warmpool</code> tries the injection layout from inside the cluster (in-cluster-service) too.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="caveats"><span class="num">6.</span>Caveats and trade-offs</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>A: dedicated runtime image</th><th>B: inject into an existing image (this sample)</th></tr></thead>
+  <tbody>
+    <tr><td>Image rebuild</td><td>required (sandboxd + tools bundled)</td><td><strong>not required</strong></td></tr>
+    <tr><td>What commands can see</td><td>can be kept minimal</td><td>everything in the app image</td></tr>
+    <tr><td>Isolation</td><td>stronger</td><td>weaker (attack surface is the whole image)</td></tr>
+    <tr><td>PID 1</td><td>the image can provide an init</td><td>sandboxd itself</td></tr>
+  </tbody>
+</table>
+</div>
+
+<ul>
+  <li><strong>The PID 1 problem:</strong> sandboxd reaps the processes it starts, but it is not a general zombie reaper. In long-lived sandboxes whose commands fork background daemons, orphans may linger as zombies. Prefer A in that case, or use an image with a minimal init such as <code>tini</code> and run sandboxd as its child.</li>
+  <li><strong>Installed packages are ephemeral.</strong> <code>/workspace</code> is an <code>emptyDir</code>, so it goes away when the sandbox closes. If you need the same packages every time, an image that already contains them (A, or a different injection target) is faster and more reliable.</li>
+  <li><strong>Egress is open.</strong> Public internet egress is allowed for <code>pip install</code>, so any code in the sandbox can reach the same destinations.</li>
+  <li><strong>Resource limits:</strong> the container is capped at <code>memory: 512Mi</code> / <code>cpu: 500m</code>. Building large packages or heavy workloads may need more.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="references"><span class="num">7.</span>References</h2>
+<ul>
+  <li><a href="../">Agent Sandbox Explained (main guide)</a>: how the CRDs, sandboxd, and the TypeScript SDK work</li>
+  <li><a href="https://github.com/khirotaka/try-agent-sandbox-ts/blob/main/manifests/sandbox-template-and-pool-inject.yaml">manifests/sandbox-template-and-pool-inject.yaml</a> / <a href="https://github.com/khirotaka/try-agent-sandbox-ts/blob/main/python-sandbox/main.ts">python-sandbox/main.ts</a></li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/blob/7d97d6e52832f95d1fb7e87078f324ae486d180b/examples/sandboxd-sandbox/deploy/b-inject-binary.yaml">examples/sandboxd-sandbox/deploy/b-inject-binary.yaml</a>: the upstream injection sample</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/blob/7d97d6e52832f95d1fb7e87078f324ae486d180b/packages/sandboxd/USER_GUIDE.md">packages/sandboxd/USER_GUIDE.md</a>: deployment topologies A / B</li>
+</ul>
+
+<footer class="site-footer">
+  <p>An unofficial guide, based on khirotaka/agent-sandbox commit <code>7d97d6e</code> and agent-sandbox controller v1.0.4. Spotted a mistake? Please open an <a href="https://github.com/khirotaka/try-agent-sandbox-ts/issues">issue</a>.</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

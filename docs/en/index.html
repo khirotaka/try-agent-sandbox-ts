@@ -923,7 +923,12 @@ flowchart LR
 <pre class="code"><code>task cluster:create    <span class="c-cm"># kind + controller v1.0.4 + sandboxd image + Template/WarmPool</span>
 task playground:run    <span class="c-cm"># from outside the cluster via port-forward</span>
 task job:run           <span class="c-cm"># from inside the cluster via in-cluster-service</span>
+task python-sandbox:run <span class="c-cm"># python / pip in a pool that injects sandboxd into a python image</span>
 task cluster:delete</code></pre>
+
+<div class="callout">
+  <p><strong>Follow-up:</strong> in the default layout commands run inside the sandboxd image, so <code>python</code> and <code>pip</code> are not available. "<a href="python-inject/">Injecting sandboxd into a Python image to use pip</a>" walks through a sample that fixes this by injecting sandboxd into an unmodified <code>python:3.14-slim</code>.</p>
+</div>
 
 <!-- ============================================================ -->
 <h2 id="references"><span class="num">7.</span>References</h2>

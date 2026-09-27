@@ -30,6 +30,7 @@ tasks:
       - docker:build-sandboxd
     cmds:
       - kubectl apply -f manifests/sandbox-template-and-pool.yaml
+      - kubectl apply -f manifests/sandbox-template-and-pool-inject.yaml
 
   # Built from the submodule (not the staging registry) so the daemon always
   # matches the TypeScript SDK. The build context must be the repo root.
@@ -65,3 +66,11 @@ tasks:
       - kubectl apply -f sandbox-job/k8s/job.yaml
       - kubectl wait --for=condition=complete job/sandbox-job --timeout=120s
       - kubectl logs job/sandbox-job
+
+  python-sandbox:run:
+    deps:
+      - build:sandbox-client
+    dir: python-sandbox
+    cmds:
+      - npm install
+      - npm run dev
