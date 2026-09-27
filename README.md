@@ -54,8 +54,9 @@ This single command:
 2. Installs the agent-sandbox controller with extensions (v1.0.4)
 3. Builds the `sandboxd` image from the submodule (so the daemon always matches the TypeScript client) and loads it into kind
 4. Applies the `sandboxd-template` SandboxTemplate and `sandboxd-warmpool` SandboxWarmPool ([manifests/sandbox-template-and-pool.yaml](manifests/sandbox-template-and-pool.yaml))
+5. Applies the `sandboxd-inject-template` SandboxTemplate and `sandboxd-inject-warmpool` SandboxWarmPool ([manifests/sandbox-template-and-pool-inject.yaml](manifests/sandbox-template-and-pool-inject.yaml)), used by the Python demo (4c)
 
-The sandbox runs sandboxd as its only container, so commands execute inside the sandboxd image (`debian:bookworm-slim` with a shell and coreutils — no language runtimes).
+The `sandboxd-warmpool` sandbox runs sandboxd as its only container, so commands execute inside the sandboxd image (`debian:bookworm-slim` with a shell and coreutils — no language runtimes).
 
 ### 4a. Run the playground demo
 
@@ -99,6 +100,25 @@ Sandbox deleted.
 
 (stderr/exitCode lines and the client's `[agentic-sandbox-client]` log lines are omitted above.)
 
+### 4c. Run the Python demo (sandboxd injected into a Python image)
+
+```bash
+task python-sandbox:run
+```
+
+The default sandbox has no language runtimes, because commands run inside the sandboxd image. [manifests/sandbox-template-and-pool-inject.yaml](manifests/sandbox-template-and-pool-inject.yaml) instead injects sandboxd into an unmodified `python:3.14-slim` image: an initContainer copies the sandboxd binary into a shared `emptyDir`, and the python container runs it as its command. Commands then execute inside the python image, so `python` and `pip` are available without rebuilding any image. This follows `examples/sandboxd-sandbox/deploy/b-inject-binary.yaml` in the submodule.
+
+The demo ([python-sandbox/main.ts](python-sandbox/main.ts)) claims a sandbox from `sandboxd-inject-warmpool` over port-forward, then:
+
+1. Prints `python --version`
+2. Writes `hello.py` with `sandbox.files.write()` and runs it
+3. Runs `pip install numpy` (a user install under `HOME=/workspace`, since the container runs as uid 1000)
+4. Writes and runs a script that imports numpy
+
+The template sets `dnsPolicy: None` with public resolvers: a custom `networkPolicy` replaces the controller's defaults, and its egress rule would otherwise block kube-dns and make `pip install` hang.
+
+A walkthrough is on the docs site: [日本語](https://khirotaka.github.io/try-agent-sandbox-ts/python-inject/) / [English](https://khirotaka.github.io/try-agent-sandbox-ts/en/python-inject/).
+
 ## Teardown
 
 ```bash
@@ -112,9 +132,10 @@ task cluster:delete
 ├── agent-sandbox/      # Submodule — khirotaka/agent-sandbox (fork of kubernetes-sigs/agent-sandbox)
 │   ├── clients/typescript/agentic-sandbox-client/   # TypeScript client source
 │   └── packages/sandboxd/                           # sandboxd runtime daemon (image built from here)
-├── docs/               # GitHub Pages explainer (ja: docs/index.html, en: docs/en/index.html)
-├── manifests/          # SandboxTemplate (sandboxd + NetworkPolicy) and SandboxWarmPool
+├── docs/               # GitHub Pages explainer (ja: docs/index.html, en: docs/en/index.html; Python demo: docs/python-inject/)
+├── manifests/          # SandboxTemplate + SandboxWarmPool: sandboxd only, and sandboxd injected into python:3.14-slim
 ├── playground/         # Interactive demo — runs locally via tsx (port-forward connectivity)
+├── python-sandbox/     # Python demo — runs python / pip in the injected sandbox (port-forward connectivity)
 ├── sandbox-job/        # Kubernetes Job demo — runs inside the cluster (in-cluster-service connectivity)
 │   ├── src/main.ts     # Job entrypoint: creates sandbox, runs commands, cleans up
 │   ├── Dockerfile      # Build context: project root

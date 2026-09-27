@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python イメージへの sandboxd 注入</title>
+<meta name="description" content="initContainer で sandboxd バイナリを無改造の python:3.14-slim イメージに注入し、TypeScript SDK から python の実行と pip install を試すサンプルの解説。">
+<link rel="alternate" hreflang="ja" href="./">
+<link rel="alternate" hreflang="en" href="../en/python-inject/">
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+  try {
+    var t = localStorage.getItem("as-doc-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<script type="module" src="../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <button class="toc-toggle" type="button" aria-label="目次">☰</button>
+  <a class="site-title" href="../">Agent Sandbox 解説（非公式）</a>
+  <span class="header-spacer"></span>
+  <nav class="lang-tabs" aria-label="言語">
+    <a href="./" data-lang="ja" aria-current="page">日本語</a>
+    <a href="../en/python-inject/" data-lang="en">English</a>
+  </nav>
+  <button class="theme-toggle" type="button" aria-label="テーマ切替">☾</button>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="目次">
+  <p class="toc-title">目次</p>
+  <ol>
+    <li><a href="#overview">0. はじめに</a></li>
+    <li><a href="#why">1. なぜ注入が必要か</a></li>
+    <li><a href="#how">2. 注入のしくみ</a></li>
+    <li><a href="#manifest">3. マニフェストの要点</a>
+      <ol>
+        <li><a href="#manifest-init">initContainer</a></li>
+        <li><a href="#manifest-app">python コンテナ</a></li>
+        <li><a href="#manifest-home">HOME の上書き</a></li>
+        <li><a href="#manifest-dns">NetworkPolicy と DNS</a></li>
+        <li><a href="#manifest-diff">upstream サンプルとの差分</a></li>
+      </ol>
+    </li>
+    <li><a href="#client">4. クライアント（python-sandbox）</a></li>
+    <li><a href="#run">5. 動かしてみる</a></li>
+    <li><a href="#caveats">6. 注意点とトレードオフ</a></li>
+    <li><a href="#references">7. 参考リンク</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<p><a href="../">← Agent Sandbox 解説（本編）に戻る</a></p>
+
+<section class="hero" id="overview">
+  <h1>Python イメージに sandboxd を注入して pip を使う</h1>
+  <p class="lede">sandboxd の既定構成ではコマンドが sandboxd イメージ（シェルと coreutils だけ）の中で実行されるため、<code>python</code> も <code>pip</code> もありません。このサンプルは、<strong>イメージを再ビルドせずに</strong>公式の <code>python:3.14-slim</code> に sandboxd バイナリを注入し、TypeScript SDK から Python スクリプトの実行と <code>pip install numpy</code> を試します。</p>
+  <div class="badges">
+    <span class="badge">topology B（バイナリ注入）</span>
+    <span class="badge">python:3.14-slim</span>
+    <span class="badge">sandboxd-inject-warmpool</span>
+  </div>
+</section>
+
+<p>このページで扱うファイルは次の 3 つです。</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ファイル</th><th>役割</th></tr></thead>
+  <tbody>
+    <tr><td><code>manifests/sandbox-template-and-pool-inject.yaml</code></td><td>sandboxd を注入する SandboxTemplate <code>sandboxd-inject-template</code> と SandboxWarmPool <code>sandboxd-inject-warmpool</code></td></tr>
+    <tr><td><code>python-sandbox/main.ts</code></td><td>上のプールから Sandbox を払い出し、<code>python</code> / <code>pip</code> を実行するクライアント</td></tr>
+    <tr><td><code>Taskfile.yaml</code></td><td><code>cluster:install-sandbox-template-and-pool</code> で注入版マニフェストも apply、<code>python-sandbox:run</code> タスクを追加</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>ベースにしたのは agent-sandbox の <code>examples/sandboxd-sandbox/deploy/b-inject-binary.yaml</code>（Node.js イメージに注入する例）です。</p>
+
+<!-- ============================================================ -->
+<h2 id="why"><span class="num">1.</span>なぜ注入が必要か</h2>
+
+<p>本編の「<a href="../#sandboxd-topology">デプロイ構成</a>」で触れたとおり、<strong>コマンドは sandboxd プロセスが動いているコンテナのルートファイルシステムで実行されます</strong>。sandboxd の gRPC <code>Execute</code> は、自分自身のコンテナの中で <code>exec</code> するだけだからです。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph A["A: 既定（manifests/sandbox-template-and-pool.yaml）"]
+    direction LR
+    A1["sandboxd イメージ&lt;br/&gt;debian-slim + sh + coreutils"] --> A2["run('python', ...)&lt;br/&gt;→ NOT_FOUND"]
+  end
+  subgraph X["うまくいかない: サイドカー"]
+    direction LR
+    X1["python コンテナ"] --- X3[("/workspace 共有")] --- X2["sandboxd コンテナ"] --> X4["run('python', ...)&lt;br/&gt;→ sandboxd 側で探すので NOT_FOUND"]
+  end
+  subgraph B["B: 注入（このサンプル）"]
+    direction LR
+    B1["python:3.14-slim が&lt;br/&gt;sandboxd を command として起動"] --> B2["run('python', ...)&lt;br/&gt;→ /usr/local/bin/python が見つかる"]
+  end
+  A ~~~ X ~~~ B
+</pre>
+<figcaption>図 1: どこに sandboxd を置くかで、コマンドから見えるツールが決まる。</figcaption>
+</figure>
+
+<p>選択肢は 2 つあります。</p>
+<ul>
+  <li><strong>A': ランタイムイメージを自作する</strong> — sandboxd と Python を同じイメージに焼き込む。隔離は強いが、イメージのビルド・配布が必要。</li>
+  <li><strong>B: 既存イメージにバイナリを注入する</strong> — sandboxd は静的リンクの単一バイナリなので、initContainer で共有ボリュームにコピーし、既存イメージの <code>command</code> を差し替えるだけで済む。<strong>このサンプルはこちら</strong>。</li>
+</ul>
+
+<div class="callout">
+  <p><strong>ポイント:</strong> 共有ボリュームが運べるのは<em>ファイル</em>であって<em>実行環境</em>ではありません。<code>python</code> を使いたければ、sandboxd 自身が <code>python</code> を持つイメージの中で動いている必要があります。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="how"><span class="num">2.</span>注入のしくみ</h2>
+
+<p>Pod の起動は 2 段階です。まず initContainer が sandboxd イメージからバイナリを取り出して <code>emptyDir</code> に置き、次に python コンテナがそのバイナリを PID 1 として起動します。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph POD["Sandbox Pod（sandboxd-inject-template）"]
+    direction LR
+    subgraph INIT["initContainer: install-sandboxd&lt;br/&gt;image: kind.local/sandboxd:latest"]
+      CP["cp /usr/local/bin/sandboxd&lt;br/&gt;/sandboxd-bin/sandboxd"]
+    end
+    BIN[("emptyDir&lt;br/&gt;sandboxd-bin")]
+    subgraph APP["container: python&lt;br/&gt;image: python:3.14-slim（無改造）"]
+      D["PID 1: /sandboxd-bin/sandboxd&lt;br/&gt;REST :8080 / gRPC :9090"]
+      PY["子プロセス&lt;br/&gt;python / pip / sh"]
+    end
+    WS[("emptyDir&lt;br/&gt;workspace → /workspace")]
+  end
+  CP -- "書き込み" --> BIN
+  BIN -- "readOnly でマウント" --> D
+  D -- "exec（同じ rootfs）" --> PY
+  D --- WS
+  PY -- "cwd / HOME" --> WS
+</pre>
+<figcaption>図 2: Pod の構成。python イメージの中身は一切変えず、command だけを差し替える。</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant K as kubelet
+  participant I as install-sandboxd（init）
+  participant P as python コンテナ
+  participant D as sandboxd（PID 1）
+  K->>I: 起動（sandboxd イメージ）
+  I->>I: cp sandboxd → /sandboxd-bin/
+  I-->>K: 正常終了
+  K->>P: 起動（python:3.14-slim, command 上書き）
+  P->>D: /sandboxd-bin/sandboxd --root-dir=/workspace ...
+  loop readinessProbe（1 秒間隔）
+    K->>D: GET /v1/health
+  end
+  D-->>K: 200 ok → Pod Ready → Sandbox Ready
+</pre>
+<figcaption>図 3: 起動シーケンス。Ready になった Sandbox が WarmPool で待機する。</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="manifest"><span class="num">3.</span>マニフェストの要点</h2>
+
+<p><code>manifests/sandbox-template-and-pool-inject.yaml</code> から、注入に関わる部分を抜き出して見ていきます。</p>
+
+<h3 id="manifest-init">initContainer: バイナリのコピー</h3>
+
+<pre class="code"><code>initContainers:
+  - name: install-sandboxd
+    image: kind.local/sandboxd:latest   <span class="c-cm"># task docker:build-sandboxd でビルドしたもの</span>
+    command: ["/bin/sh", "-c", "cp /usr/local/bin/sandboxd /sandboxd-bin/sandboxd"]
+    securityContext:
+      runAsUser: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }
+    volumeMounts:
+      - name: sandboxd-bin
+        mountPath: /sandboxd-bin</code></pre>
+
+<ul>
+  <li>sandboxd イメージを参照するのは<strong>ここだけ</strong>です。upstream サンプルはステージングレジストリのイメージを使いますが、このリポジトリでは submodule からビルドした <code>kind.local/sandboxd:latest</code> を使い、TypeScript SDK とデーモンのバージョンを必ず揃えています。</li>
+  <li>Pod の <code>securityContext.fsGroup: 1000</code> により、非 root（uid 1000）でも <code>emptyDir</code> に書き込めます。</li>
+</ul>
+
+<h3 id="manifest-app">python コンテナ: command の差し替え</h3>
+
+<pre class="code"><code>containers:
+  - name: python
+    image: python:3.14-slim             <span class="c-cm"># 無改造の公式イメージ</span>
+    command:
+      - /sandboxd-bin/sandboxd          <span class="c-cm"># 注入したバイナリを起動</span>
+      - --root-dir=/workspace
+      - --rest-port=8080
+      - --grpc-port=9090
+    readinessProbe:
+      httpGet: { path: /v1/health, port: 8080 }
+      periodSeconds: 1
+    volumeMounts:
+      - name: sandboxd-bin
+        mountPath: /sandboxd-bin
+        readOnly: true                  <span class="c-cm"># サンドボックス内のコマンドから差し替えられないように</span>
+      - name: workspace
+        mountPath: /workspace</code></pre>
+
+<ul>
+  <li><code>command</code> を上書きすると、イメージ本来の <code>ENTRYPOINT</code>/<code>CMD</code>（python の REPL）は起動せず、代わりに sandboxd が動きます。<code>PATH</code> などイメージの環境変数はそのまま引き継がれ、sandboxd が起動する子プロセスにも渡ります。</li>
+  <li><code>sandboxd-bin</code> を <strong><code>readOnly: true</code></strong> でマウントしているのが重要です。書き込み可能だと、サンドボックス内で動く信頼できないコードがバイナリを置き換え、コンテナ再起動時にそれが PID 1 として実行されてしまいます。</li>
+  <li>readinessProbe の <code>periodSeconds: 1</code> は、プールの Sandbox を少しでも早く Ready にするための調整です。</li>
+</ul>
+
+<h3 id="manifest-home">HOME を /workspace に向ける</h3>
+
+<pre class="code"><code>env:
+  - name: SANDBOX_EXAMPLE             <span class="c-cm"># sandbox.metadata() で見える</span>
+    value: try-agent-sandbox-ts
+  - name: HOME
+    value: /workspace</code></pre>
+
+<p><code>python:3.14-slim</code> は root で動く前提のイメージで、<code>HOME</code> は <code>/root</code> です。ここでは <code>runAsUser: 1000</code> で動かしているため <code>/root</code> は読めず、pip のキャッシュやユーザーインストールが壊れます。</p>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  PIP["pip install numpy（uid 1000）"] --> SP{"/usr/local/lib/python3.14/site-packages&lt;br/&gt;に書ける？"}
+  SP -- "いいえ（root 所有）" --> USER["ユーザーインストールに切り替え&lt;br/&gt;（Defaulting to user installation）"]
+  USER --> H{"HOME は？"}
+  H -- "/root（既定）" --> NG["書き込めず失敗"]
+  H -- "/workspace（上書き）" --> OK["/workspace/.local/lib/python3.14/site-packages&lt;br/&gt;にインストール"]
+  OK --> IMP["python から import numpy 可能&lt;br/&gt;（user site は HOME から解決）"]
+</pre>
+<figcaption>図 4: 非 root で pip を使うときの流れ。HOME の上書きがないとインストールできない。</figcaption>
+</figure>
+
+<p>インストール先が <code>/workspace</code>（<code>emptyDir</code>）になるので、入れたパッケージは Sandbox の寿命と一緒に消えます。<code>sandbox.files.list(".local")</code> で SDK から中身を確認することもできます。</p>
+
+<h3 id="manifest-dns">NetworkPolicy と DNS</h3>
+
+<p><code>pip install</code> は PyPI へのアクセス、つまり<strong>外向き通信と名前解決</strong>を必要とします。ここにひとつ落とし穴があります。</p>
+
+<ul>
+  <li>テンプレートで <code>networkPolicy</code> を指定すると、コントローラの安全な既定値は<strong>丸ごと置き換わります</strong>。そのため、既定の egress ルール（パブリックインターネットのみ、RFC1918 やリンクローカルは遮断）を明示的に書き直しています。</li>
+  <li>コントローラは <code>networkPolicy</code> を<em>省略</em>したときだけ、Pod の DNS を公開リゾルバに差し替えます。カスタムポリシーを書いた場合は既定の <code>ClusterFirst</code> のままなので、DNS は kube-dns（<code>10.96.0.10</code>）に向かいますが、egress の <code>except: 10.0.0.0/8</code> がそれを遮断します。結果、<strong>名前解決が詰まって <code>pip install</code> がハングします</strong>。</li>
+  <li>そこで <code>dnsPolicy: None</code> と <code>dnsConfig.nameservers</code>（<code>8.8.8.8</code> / <code>1.1.1.1</code>）を書き、コントローラの既定と同じ状態に戻しています。</li>
+</ul>
+
+<pre class="code"><code>podTemplate:
+  spec:
+    dnsPolicy: None
+    dnsConfig:
+      nameservers:
+        - 8.8.8.8
+        - 1.1.1.1</code></pre>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  PIP["pip（Sandbox Pod 内）"] -- "① DNS: pypi.org" --> R{"resolver"}
+  R -- "ClusterFirst&lt;br/&gt;→ kube-dns 10.96.0.10" --> BLK["egress except 10.0.0.0/8&lt;br/&gt;で遮断 → ハング"]
+  R -- "dnsPolicy: None&lt;br/&gt;→ 8.8.8.8 / 1.1.1.1" --> PUB["公開リゾルバ（許可）"]
+  PUB --> PIP2["② HTTPS: pypi.org / files.pythonhosted.org&lt;br/&gt;（0.0.0.0/0 として許可）"]
+</pre>
+<figcaption>図 5: カスタム networkPolicy と DNS の関係。</figcaption>
+</figure>
+
+<p>ingress 側は既定構成と同じく <code>app: sandbox-job</code> からの 8080/9090 を許可しています。<code>python-sandbox</code> クライアントは port-forward で接続するので、このルールの影響は受けません（port-forward は Pod のネットワーク名前空間に直接入るため NetworkPolicy の対象外）。</p>
+
+<h3 id="manifest-diff">upstream サンプル（b-inject-binary.yaml）との差分</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>項目</th><th>upstream <code>b-inject-binary.yaml</code></th><th>このリポジトリ</th></tr></thead>
+  <tbody>
+    <tr><td>アプリイメージ</td><td><code>node:22-slim</code></td><td><code>python:3.14-slim</code></td></tr>
+    <tr><td>sandboxd イメージ</td><td>ステージングレジストリの <code>sandboxd:latest-main</code></td><td>submodule からビルドした <code>kind.local/sandboxd:latest</code></td></tr>
+    <tr><td>WarmPool 名</td><td><code>sandboxd-warmpool</code></td><td><code>sandboxd-inject-warmpool</code>（既定構成のプールと共存させるため）</td></tr>
+    <tr><td><code>service</code> / <code>networkPolicy</code></td><td>なし（コントローラの既定）</td><td><code>service: true</code> + sandbox-job 用 ingress + 既定相当の egress</td></tr>
+    <tr><td>DNS</td><td>指定なし</td><td><code>dnsPolicy: None</code> + 公開リゾルバ</td></tr>
+    <tr><td>環境変数</td><td>なし</td><td><code>HOME=/workspace</code>、<code>SANDBOX_EXAMPLE</code></td></tr>
+    <tr><td>readinessProbe</td><td>既定間隔</td><td><code>periodSeconds: 1</code></td></tr>
+    <tr><td>WarmPool <code>updateStrategy</code></td><td><code>Recreate</code></td><td>指定なし（既定の <code>OnReplenish</code>）</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="client"><span class="num">4.</span>クライアント（python-sandbox）</h2>
+
+<p><code>python-sandbox/main.ts</code> は、本編で説明した SDK の API だけで書かれています。違いは払い出し元のプール名だけです。</p>
+
+<pre class="code"><code>import { SandboxClient } from "agentic-sandbox-client";
+
+const client = new SandboxClient({ namespace: "default", quiet: true });
+const sandbox = await client.createSandbox("sandboxd-inject-warmpool"); <span class="c-cm">// ← 注入版のプール</span>
+
+try {
+  <span class="c-cm">// 1. python がイメージに入っていることを確認</span>
+  const result = await sandbox.commands.run("python", ["--version"]);
+  console.log(result.stdout);
+
+  <span class="c-cm">// 2. REST でスクリプトを書き、gRPC で実行</span>
+  await sandbox.files.write("./hello.py", `...print("Hello, from sandbox")...`);
+  const helloResult = await sandbox.commands.run("python", ["./hello.py"]);
+  console.log(helloResult.stdout);
+
+  <span class="c-cm">// 3. pip でパッケージを追加（シェル経由）</span>
+  const numpyInstall = await sandbox.commands.run("sh", ["-c", "pip install numpy"]);
+  console.log(`exit code: ${numpyInstall.exitCode}`);
+
+  <span class="c-cm">// 4. 追加したパッケージを使うスクリプトを実行</span>
+  await sandbox.files.write("./call_numpy.py", `...np.arange(0, 10, 1)...`);
+  const callNumpyResult = await sandbox.commands.run("python", ["./call_numpy.py"]);
+  console.log(callNumpyResult.stdout);
+} finally {
+  await sandbox.close();  <span class="c-cm">// Claim を削除 → Sandbox / Pod も消える</span>
+}</code></pre>
+
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as main.ts
+  participant SDK as SDK
+  participant D as sandboxd（python コンテナ内）
+  participant PyPI as PyPI
+  App->>SDK: createSandbox("sandboxd-inject-warmpool")
+  Note over SDK: Claim 作成 → プールの Ready な Sandbox を採用
+  App->>SDK: commands.run("python", ["--version"])
+  SDK->>D: gRPC Execute（port-forward 経由）
+  D-->>SDK: stdout "Python 3.14.x"
+  App->>SDK: files.write("./hello.py")
+  SDK->>D: PUT /v1/files/hello.py → /workspace/hello.py
+  App->>SDK: commands.run("python", ["./hello.py"])
+  D-->>SDK: stdout "Hello, from sandbox"
+  App->>SDK: commands.run("sh", ["-c", "pip install numpy"])
+  D->>PyPI: DNS（公開リゾルバ）+ HTTPS
+  PyPI-->>D: numpy wheel
+  Note over D: /workspace/.local にユーザーインストール
+  D-->>SDK: exitCode 0
+  App->>SDK: files.write + commands.run("python", ["./call_numpy.py"])
+  D-->>SDK: stdout "[0 1 2 3 4 5 6 7 8 9]"
+  App->>SDK: close()
+</pre>
+<figcaption>図 6: main.ts の流れ。すべてのコマンドは python:3.14-slim の rootfs の中で実行される。</figcaption>
+</figure>
+
+<ul>
+  <li><strong>ファイルとコマンドは同じ <code>/workspace</code> を見ます。</strong><code>files.write("./hello.py")</code> で書いたファイルは、cwd が <code>--root-dir</code>（<code>/workspace</code>）であるプロセスから <code>./hello.py</code> で読めます。</li>
+  <li><strong><code>run()</code> はシェルを挟みません。</strong>argv のまま exec されるので、<code>run("python", ["./hello.py"])</code> はそのまま動きます。<code>pip install numpy</code> を <code>sh -c</code> で包んでいるのはシェル機能（パイプやリダイレクトなど）を後から足しやすくするためで、<code>run("pip", ["install", "numpy"])</code> でも同じ結果になります。</li>
+  <li><strong>非 0 終了はエラーになりません。</strong><code>pip install</code> の成否は <code>exitCode</code> で判定します。失敗理由は <code>stderr</code> に出ます。</li>
+  <li><strong>タイムアウト:</strong> <code>run()</code> の既定 <code>timeoutMs</code> は 60 秒です。回線が遅い環境や大きなパッケージでは <code>{ timeoutMs: 300_000 }</code> のように延ばしてください。超過するとプロセスグループごと SIGKILL されます。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="run"><span class="num">5.</span>動かしてみる</h2>
+
+<pre class="code"><code>task cluster:create        <span class="c-cm"># kind + controller + sandboxd イメージ + 既定版 / 注入版の Template・WarmPool</span>
+task python-sandbox:run    <span class="c-cm"># python-sandbox/main.ts を実行（port-forward）</span>
+task cluster:delete</code></pre>
+
+<p>既存のクラスタに注入版だけを追加する場合は次のとおりです。</p>
+
+<pre class="code"><code>task docker:build-sandboxd
+kubectl apply -f manifests/sandbox-template-and-pool-inject.yaml
+kubectl get sandboxwarmpool sandboxd-inject-warmpool</code></pre>
+
+<p>期待される出力（バージョンや pip のログは環境によって異なります）:</p>
+
+<pre class="code"><code>Python 3.14.x
+
+Hello, from sandbox
+
+exit code: 0
+[0 1 2 3 4 5 6 7 8 9]</code></pre>
+
+<div class="callout">
+  <p><strong>ほかのクライアントから使う:</strong> <code>playground/</code> と <code>sandbox-job/</code> は既定構成の <code>sandboxd-warmpool</code> を使います。<code>sandbox-job</code> は環境変数 <code>WARMPOOL</code> でプール名を切り替えられるので、<code>sandboxd-inject-warmpool</code> を指定すればクラスタ内（in-cluster-service）からも注入版を試せます。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="caveats"><span class="num">6.</span>注意点とトレードオフ</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>A: 専用ランタイムイメージ</th><th>B: 既存イメージへ注入（このサンプル）</th></tr></thead>
+  <tbody>
+    <tr><td>イメージの再ビルド</td><td>必要（sandboxd + ツールを同梱）</td><td><strong>不要</strong></td></tr>
+    <tr><td>コマンドから見えるもの</td><td>必要最小限に絞れる</td><td>アプリイメージの中身すべて</td></tr>
+    <tr><td>隔離の強さ</td><td>強い</td><td>弱め（攻撃面がイメージ全体に広がる）</td></tr>
+    <tr><td>PID 1</td><td>イメージ側で init を用意できる</td><td>sandboxd 自身</td></tr>
+  </tbody>
+</table>
+</div>
+
+<ul>
+  <li><strong>PID 1 問題:</strong> sandboxd は自分が起動したプロセスは回収しますが、汎用のゾンビ回収（reaper）はしません。コマンドがバックグラウンドデーモンをフォークするような長寿命の Sandbox では、孤児プロセスがゾンビとして残る可能性があります。その場合は A を選ぶか、<code>tini</code> のような最小 init を入れたイメージで sandboxd を子プロセスとして起動してください。</li>
+  <li><strong>インストールしたパッケージは揮発します。</strong><code>/workspace</code> は <code>emptyDir</code> なので、Sandbox を閉じると消えます。毎回同じパッケージが必要なら、それらを入れたイメージを用意する（A または注入先のイメージを変える）ほうが速く確実です。</li>
+  <li><strong>外向き通信を開けている</strong>ことを意識してください。<code>pip install</code> のためにパブリックインターネットへの egress を許可しているので、サンドボックス内のコードも同じ範囲に通信できます。</li>
+  <li><strong>リソース上限:</strong> コンテナは <code>memory: 512Mi</code> / <code>cpu: 500m</code> に制限されています。大きなパッケージのビルドや重い処理では調整が必要です。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="references"><span class="num">7.</span>参考リンク</h2>
+<ul>
+  <li><a href="../">Agent Sandbox 解説（本編）</a> — CRD / sandboxd / TypeScript SDK のしくみ</li>
+  <li><a href="https://github.com/khirotaka/try-agent-sandbox-ts/blob/main/manifests/sandbox-template-and-pool-inject.yaml">manifests/sandbox-template-and-pool-inject.yaml</a> / <a href="https://github.com/khirotaka/try-agent-sandbox-ts/blob/main/python-sandbox/main.ts">python-sandbox/main.ts</a></li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/blob/7d97d6e52832f95d1fb7e87078f324ae486d180b/examples/sandboxd-sandbox/deploy/b-inject-binary.yaml">examples/sandboxd-sandbox/deploy/b-inject-binary.yaml</a> — upstream の注入サンプル</li>
+  <li><a href="https://github.com/khirotaka/agent-sandbox/blob/7d97d6e52832f95d1fb7e87078f324ae486d180b/packages/sandboxd/USER_GUIDE.md">packages/sandboxd/USER_GUIDE.md</a> — デプロイ構成（topology A / B）の説明</li>
+</ul>
+
+<footer class="site-footer">
+  <p>非公式の解説です。内容は khirotaka/agent-sandbox のコミット <code>7d97d6e</code> と agent-sandbox controller v1.0.4 に基づきます。誤りに気付いたら <a href="https://github.com/khirotaka/try-agent-sandbox-ts/issues">issue</a> でお知らせください。</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

@@ -923,7 +923,12 @@ flowchart LR
 <pre class="code"><code>task cluster:create    <span class="c-cm"># kind + controller v1.0.4 + sandboxd イメージ + Template/WarmPool</span>
 task playground:run    <span class="c-cm"># クラスタ外から port-forward で</span>
 task job:run           <span class="c-cm"># クラスタ内から in-cluster-service で</span>
+task python-sandbox:run <span class="c-cm"># python イメージに sandboxd を注入したプールで python / pip を実行</span>
 task cluster:delete</code></pre>
+
+<div class="callout">
+  <p><strong>続編:</strong> 既定構成ではコマンドが sandboxd イメージ内で走るため <code>python</code> や <code>pip</code> は使えません。無改造の <code>python:3.14-slim</code> に sandboxd を注入してこれを解決するサンプルを「<a href="python-inject/">Python イメージに sandboxd を注入して pip を使う</a>」で解説しています。</p>
+</div>
 
 <!-- ============================================================ -->
 <h2 id="references"><span class="num">7.</span>参考リンク</h2>

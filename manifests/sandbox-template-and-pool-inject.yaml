@@ -1,0 +1,177 @@
+# SandboxTemplate + SandboxWarmPool that INJECTS sandboxd into a tool-rich image
+# (topology B of packages/sandboxd/USER_GUIDE.md: an initContainer copies the
+# statically-linked sandboxd binary into a shared emptyDir, and an unmodified
+# python:3.14-slim image runs it as its command).
+#
+# Contrast with manifests/sandbox-template-and-pool.yaml (topology A), where
+# sandboxd is the pod's only container and therefore IS the execution
+# environment — commands only see the shell + coreutils of the sandboxd image.
+# Here sandboxd runs inside the python image's root filesystem, so commands
+# exec'd through ProcessService find `python3` and `pip` with no image rebuild.
+#
+# A shared volume moves *files*, never *binaries*: running sandboxd as a sidecar
+# next to the python container would still execute commands in the sandboxd
+# image. The binary has to be injected into the image that owns the tools.
+#
+# PID 1 caveat: sandboxd reaps the processes it starts, but as the container's
+# main process it also inherits orphaned grandchildren and does not run a
+# general zombie reaper. For long-lived sandboxes whose commands fork background
+# processes, prefer topology A or an image shipping a minimal init (e.g. tini).
+#
+# The sandboxd image is built from the agent-sandbox submodule by
+# `task docker:build-sandboxd`, so the daemon always matches the TypeScript SDK.
+#
+# Apply with:
+#   task docker:build-sandboxd
+#   kubectl apply -f manifests/sandbox-template-and-pool-inject.yaml
+#
+# The clients in this repo target the `sandboxd-warmpool` pool of topology A;
+# point them at the pool name below to use this one (sandbox-job honors
+# $WARMPOOL).
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: sandboxd-inject-template
+  namespace: default
+spec:
+  service: true
+  # Supplying networkPolicy replaces the controller's secure defaults entirely,
+  # so the default egress rule (public internet only) is restated below.
+  networkPolicy:
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                app: sandbox-job
+        ports:
+          - protocol: TCP
+            port: 8080 # REST filesystem + health/metadata
+          - protocol: TCP
+            port: 9090 # gRPC ProcessService
+    egress:
+      - to:
+          - ipBlock:
+              cidr: 0.0.0.0/0
+              except:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 169.254.0.0/16
+          - ipBlock:
+              cidr: ::/0
+              except:
+                - fc00::/7
+                - fe80::/10
+  podTemplate:
+    spec:
+      # The sandbox runs untrusted agent code; it needs no API access.
+      automountServiceAccountToken: false
+      # The controller only swaps in public resolvers when networkPolicy is
+      # omitted. With the custom policy above, the default ClusterFirst DNS
+      # would point at kube-dns (10.96.0.10), which the egress `except` blocks,
+      # so name resolution (e.g. `pip install`) would hang. Restate the
+      # controller's DNS default so lookups go to public resolvers instead.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 1.1.1.1
+      restartPolicy: "OnFailure"
+      securityContext:
+        runAsNonRoot: true
+        # Ensure the workspace emptyDir is writable by the non-root runtime user.
+        fsGroup: 1000
+      initContainers:
+        # Copy the sandboxd binary out of the runtime image into a shared
+        # volume. This is the only place the sandboxd image is referenced; the
+        # python image below is never modified.
+        - name: install-sandboxd
+          image: kind.local/sandboxd:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "cp /usr/local/bin/sandboxd /sandboxd-bin/sandboxd"]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: sandboxd-bin
+              mountPath: /sandboxd-bin
+      containers:
+        # The unmodified python image that already ships the tools the agent
+        # will invoke. Only the command is overridden, to launch the injected
+        # sandboxd binary instead of the image's own python entrypoint.
+        - name: python
+          image: python:3.14-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - /sandboxd-bin/sandboxd
+            - --root-dir=/workspace
+            - --rest-port=8080
+            - --grpc-port=9090
+          env:
+            # Exposed through sandbox.metadata() (sandboxd serves only the
+            # SANDBOX_ prefix and withholds credential-looking names).
+            - name: SANDBOX_EXAMPLE
+              value: try-agent-sandbox-ts
+            # The image's default HOME (/root) is unreadable for uid 1000, which
+            # breaks `pip install --user` and the pip cache; point it at the
+            # workspace volume instead.
+            - name: HOME
+              value: /workspace
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8080 # REST filesystem + probes
+            - containerPort: 9090 # gRPC ProcessService
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            periodSeconds: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            # Read-only: sandboxed commands must not be able to replace the
+            # injected binary (it would run on the next container restart).
+            - name: sandboxd-bin
+              mountPath: /sandboxd-bin
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: sandboxd-bin
+          emptyDir: {}
+        - name: workspace
+          emptyDir: {}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: sandboxd-inject-warmpool
+  namespace: default
+spec:
+  replicas: 1
+  sandboxTemplateRef:
+    name: sandboxd-inject-template
